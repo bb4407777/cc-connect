@@ -355,6 +355,45 @@ func TestPollLoop_DoesNotNotifyReadyForPollWhileGetUpdatesFails(t *testing.T) {
 	}
 }
 
+func TestPollLoop_DispatchInboundFalseCachesTokenWithoutHandlingMessage(t *testing.T) {
+	body := `{"ret":0,"errcode":0,"msgs":[{"from_user_id":"user-1","context_token":"fresh-token","message_type":1}],"get_updates_buf":"buf-1"}`
+	srv := newILinkTestServer(http.StatusOK, body)
+	defer srv.Close()
+
+	p := &Platform{
+		token:                  "tok",
+		baseURL:                srv.URL(),
+		allowFrom:              "user-1",
+		longPollMS:             100,
+		accountLabel:           "default",
+		dispatchInboundEnabled: false,
+		httpClient:             &http.Client{},
+		dedup:                  make(map[string]time.Time),
+		tokens:                 make(map[string]string),
+		typingTickets:          make(map[string]typingTicketEntry),
+	}
+	p.api = newAPIClient(srv.URL(), "tok", "", p.httpClient)
+
+	handled := make(chan struct{}, 1)
+	if err := p.Start(func(core.Platform, *core.Message) { handled <- struct{}{} }); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	deadline := time.Now().Add(2 * time.Second)
+	for p.getContextToken("user-1") != "fresh-token" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := p.getContextToken("user-1"); got != "fresh-token" {
+		t.Fatalf("cached token = %q, want fresh-token", got)
+	}
+	select {
+	case <-handled:
+		t.Fatal("inbound message was dispatched while dispatch_inbound=false")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestPlatform_ImplementsAsyncRecoverablePlatform(t *testing.T) {
 	var p core.Platform = &Platform{}
 	if _, ok := p.(core.AsyncRecoverablePlatform); !ok {

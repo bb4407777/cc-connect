@@ -47,14 +47,15 @@ type replyContext struct {
 // Platform implements core.Platform for Weixin personal chat via the ilink bot HTTP API
 // (same backend as the OpenClaw openclaw-weixin plugin: long-poll getUpdates + sendMessage).
 type Platform struct {
-	token        string
-	baseURL      string
-	cdnBaseURL   string
-	allowFrom    string
-	routeTag     string
-	stateDir     string
-	longPollMS   int
-	accountLabel string
+	token                  string
+	baseURL                string
+	cdnBaseURL             string
+	allowFrom              string
+	routeTag               string
+	stateDir               string
+	longPollMS             int
+	accountLabel           string
+	dispatchInboundEnabled bool
 
 	httpClient    *http.Client
 	cdnHttpClient *http.Client // 专用于 CDN 上传/下载，不走代理
@@ -113,6 +114,7 @@ func sanitizePathSegment(s string) string {
 
 // New constructs a Weixin platform. Required options: token.
 // Optional: base_url, cdn_base_url (default https://novac2c.cdn.weixin.qq.com/c2c), allow_from, route_tag, account_id, long_poll_timeout_ms,
+// dispatch_inbound (default true; false keeps polling only to refresh outbound context tokens),
 // state_dir (override persistence dir), proxy, cc_data_dir + cc_project (injected by main).
 func New(opts map[string]any) (core.Platform, error) {
 	token, _ := opts["token"].(string)
@@ -134,6 +136,10 @@ func New(opts map[string]any) (core.Platform, error) {
 		accountLabel = "default"
 	}
 	lp := pickInt(opts["long_poll_timeout_ms"])
+	dispatchInbound := true
+	if v, ok := opts["dispatch_inbound"].(bool); ok {
+		dispatchInbound = v
+	}
 
 	dataDir, _ := opts["cc_data_dir"].(string)
 	project, _ := opts["cc_project"].(string)
@@ -168,19 +174,20 @@ func New(opts map[string]any) (core.Platform, error) {
 	}
 
 	p := &Platform{
-		token:         token,
-		baseURL:       baseURL,
-		cdnBaseURL:    cdnBaseURL,
-		allowFrom:     allowFrom,
-		routeTag:      routeTag,
-		stateDir:      stateDir,
-		longPollMS:    lp,
-		accountLabel:  accountLabel,
-		httpClient:    httpClient,
-		cdnHttpClient: cdnHttpClient,
-		tokens:        make(map[string]string),
-		dedup:         make(map[string]time.Time),
-		typingTickets: make(map[string]typingTicketEntry),
+		token:                  token,
+		baseURL:                baseURL,
+		cdnBaseURL:             cdnBaseURL,
+		allowFrom:              allowFrom,
+		routeTag:               routeTag,
+		stateDir:               stateDir,
+		longPollMS:             lp,
+		accountLabel:           accountLabel,
+		dispatchInboundEnabled: dispatchInbound,
+		httpClient:             httpClient,
+		cdnHttpClient:          cdnHttpClient,
+		tokens:                 make(map[string]string),
+		dedup:                  make(map[string]time.Time),
+		typingTickets:          make(map[string]typingTicketEntry),
 	}
 	p.api = newAPIClient(baseURL, token, routeTag, httpClient)
 
@@ -314,6 +321,9 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	p.handler = handler
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
+	if !p.dispatchInboundEnabled {
+		slog.Info("weixin: inbound dispatch disabled; polling only for outbound context tokens")
+	}
 	go p.pollLoop(ctx)
 	return nil
 }
@@ -405,12 +415,17 @@ func (p *Platform) pollLoop(ctx context.Context) {
 
 		p.mu.RLock()
 		h := p.handler
+		dispatchInbound := p.dispatchInboundEnabled
 		p.mu.RUnlock()
-		if h == nil {
-			continue
-		}
 		var wg sync.WaitGroup
 		for i := range resp.Msgs {
+			if !dispatchInbound {
+				p.cacheInboundContextToken(&resp.Msgs[i])
+				continue
+			}
+			if h == nil {
+				continue
+			}
 			i := i
 			wg.Add(1)
 			go func() {
@@ -426,6 +441,21 @@ func (p *Platform) pollLoop(ctx context.Context) {
 			p.syncBufMu.Unlock()
 		}
 	}
+}
+
+// cacheInboundContextToken keeps outbound cron/timer delivery working when
+// another consumer owns inbound message handling. It deliberately does not
+// dispatch the message or start typing.
+func (p *Platform) cacheInboundContextToken(m *weixinMessage) {
+	if m == nil {
+		return
+	}
+	from := strings.TrimSpace(m.FromUserID)
+	tok := strings.TrimSpace(m.ContextToken)
+	if from == "" || tok == "" || !core.AllowList(p.allowFrom, from) {
+		return
+	}
+	p.setContextToken(from, tok)
 }
 
 func (p *Platform) dispatchInbound(ctx context.Context, m *weixinMessage, h core.MessageHandler) {
