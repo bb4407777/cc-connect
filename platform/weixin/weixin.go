@@ -3,6 +3,8 @@ package weixin
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"net"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -15,6 +17,9 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -168,9 +173,32 @@ func New(opts map[string]any) (core.Platform, error) {
 	}
 
 	// CDN 客户端：微信国内 CDN 必须直连，绕过环境变量中的代理（如 HTTPS_PROXY）
+	// 2026-08-12 Hermes: 微信 CDN 按 TLS/JA3 指纹拒绝 Go 标准库握手（remote error: tls: handshake failure），
+	// 改用 uTLS 伪装 Chrome 指纹（curl/Node 均能握手，仅 Go 被拒）。
 	cdnHttpClient := &http.Client{
-		Timeout:   60 * time.Second,
-		Transport: &http.Transport{Proxy: nil},
+		Timeout: 60 * time.Second,
+		Transport: &http2.Transport{
+			AllowHTTP: false,
+			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+				rawConn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				host, _, err := net.SplitHostPort(addr)
+				if err != nil {
+					host = addr
+				}
+				uConn := utls.UClient(rawConn, &utls.Config{
+					ServerName:         host,
+					InsecureSkipVerify: false,
+				}, utls.HelloChrome_120)
+				if err := uConn.HandshakeContext(ctx); err != nil {
+					rawConn.Close()
+					return nil, err
+				}
+				return uConn, nil
+			},
+		},
 	}
 
 	p := &Platform{

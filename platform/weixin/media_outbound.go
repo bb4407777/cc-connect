@@ -93,9 +93,15 @@ func (p *Platform) uploadToWeixinCDN(ctx context.Context, to string, plaintext [
 			uploadClient = p.httpClient
 		}
 	} else {
-		// 旧版 API：用 upload_param 构建 URL，使用配置的 httpClient
+		// 旧版 API：用 upload_param 构建 URL。
+		// 2026-08-12 Hermes: 原用 p.httpClient（Go 标准 TLS 栈，被微信 CDN 按 JA3 指纹拒绝），
+		// 统一改走 cdnHttpClient（uTLS Chrome 指纹）。
 		cdnUploadURL = buildCdnUploadURL(p.cdnBaseURL, resp.UploadParam, filekey)
-		uploadClient = p.httpClient
+		if isWeixinCDNHost(cdnUploadURL) {
+			uploadClient = p.cdnHttpClient
+		} else {
+			uploadClient = p.httpClient
+		}
 	}
 	dl, err := uploadBufferToCDN(ctx, uploadClient, cdnUploadURL, plaintext, aesKey, label)
 	if err != nil {
