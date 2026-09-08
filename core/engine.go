@@ -74,6 +74,15 @@ const (
 	slowAgentFirstEvent = 15 * time.Second // time from send to first agent event
 )
 
+// closeTimeout bounds a single agent session teardown. It must cover the
+// agent's own graceful shutdown sequence: stdin close → Stop hooks
+// (claude-mem summary etc.) → SIGTERM → SIGKILL (with retries). Claude Code's
+// Stop hooks can take up to 120s (claude-mem uses a sonnet summarizer), so the
+// 150s budget covers the 120s graceful phase + 5s SIGTERM + ~16s of bounded
+// SIGKILL retries/confirmation + buffer. The wait ends early if the process
+// exits sooner — this is the ceiling, not the typical duration.
+const closeTimeout = 150 * time.Second
+
 const (
 	replyFooterUsageTimeout  = 1500 * time.Millisecond
 	replyFooterUsageCacheTTL = 30 * time.Second
@@ -189,6 +198,23 @@ func (e *Engine) SetPendingRestartTimeout(d time.Duration) {
 // onPlatformReady (also on a goroutine).
 func (e *Engine) runPendingRestartNotify(req *RestartRequest, firedCh chan struct{}) {
 	defer close(firedCh)
+
+	// Recover from any panic inside dispatch (ReconstructReplyCtx / Send) so a
+	// platform-side panic cannot take down the whole cc-connect process.
+	// See #1686 P1-A. Without this defer, a panic in the restart-notify
+	// goroutine kills the daemon because no higher-level recover exists.
+	defer func() {
+		if r := recover(); r != nil {
+			const maxStackBytes = 8192
+			stack := make([]byte, maxStackBytes)
+			n := runtime.Stack(stack, false)
+			slog.Error("restart notify panic",
+				"platform", req.Platform,
+				"session", req.SessionKey,
+				"panic", r,
+				"stack", string(stack[:n]))
+		}
+	}()
 
 	// Wait briefly for the platform to reach ready if it's not already.
 	// Upper bound: matches the typical Telegram 2-3 s connect window
@@ -443,6 +469,16 @@ type Engine struct {
 	// Interactive agent session management
 	interactiveMu     sync.Mutex
 	interactiveStates map[string]*interactiveState // key = sessionKey
+
+	// Teardown tracking. A session's state is removed from interactiveStates
+	// as soon as /stop is issued, but its OS process can live on for up to
+	// closeTimeout while it drains stdin and runs Stop hooks. Without the two
+	// maps below, a message arriving in that window spawns a second process
+	// that resumes the *same* agent session ID — two live agents then share
+	// one conversation lineage, each acting on it independently.
+	closingMu       sync.Mutex
+	closingSessions map[string]chan struct{} // sessionKey → closed when teardown finishes
+	unsafeResume    map[string]bool          // sessionKey → next spawn must start fresh, not resume
 
 	platformLifecycleMu sync.Mutex
 	platformReady       map[Platform]bool
@@ -727,6 +763,8 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		skills:                NewSkillRegistry(),
 		aliases:               make(map[string]string),
 		interactiveStates:     make(map[string]*interactiveState),
+		closingSessions:       make(map[string]chan struct{}),
+		unsafeResume:          make(map[string]bool),
 		sendWorkDirs:          make(map[string]string),
 		platformReady:         make(map[Platform]bool),
 		startedAt:             time.Now(),
@@ -1205,6 +1243,42 @@ var privilegedCommands = map[string]bool{
 	"upgrade": true,
 	"web":     true,
 	"diff":    true,
+}
+
+// isPrivilegedCommandInvocation extends the privilegedCommands map to
+// also gate specific destructive subcommands. Currently:
+//
+//   - /commands addexec ...    — registers a custom shell-exec command
+//   - /cron    addexec ...     — schedules a recurring shell-exec
+//
+// Both effectively create new admin-only commands at runtime; if a
+// non-admin can call addexec, they can install arbitrary shell commands
+// for any future user to trigger. Sibling subcommands (list, add, del,
+// etc.) remain non-privileged.
+//
+// Returns true when the cmdID itself is in privilegedCommands, or when
+// the (cmdID, args[0]) pair matches one of the explicitly-gated
+// subcommands above.
+func isPrivilegedCommandInvocation(cmdID string, args []string) bool {
+	if privilegedCommands[cmdID] {
+		return true
+	}
+	if len(args) == 0 {
+		return false
+	}
+	sub := strings.ToLower(args[0])
+	switch cmdID {
+	case "commands":
+		return matchSubCommand(sub, []string{
+			"list", "add", "addexec", "del", "delete", "rm", "remove",
+		}) == "addexec"
+	case "cron":
+		return matchSubCommand(sub, []string{
+			"add", "addexec", "list", "del", "delete", "rm", "remove", "enable", "disable", "mute", "unmute", "setup",
+		}) == "addexec"
+	default:
+		return false
+	}
 }
 
 // isAdmin checks whether the given user ID is authorized for privileged commands.
@@ -2837,6 +2911,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	var wsAgent Agent
 	var wsSessions *SessionManager
 	var resolvedWorkspace string
+	if e.multiWorkspace {
+		e.migrateLegacyWorkspaceBindings(msg)
+	}
 	if forcedWorkDir := e.sendWorkDirForSession(msg.SessionKey); forcedWorkDir != "" {
 		e.bindSendWorkDir(msg.SessionKey, forcedWorkDir)
 		var err error
@@ -2999,6 +3076,7 @@ sessionLocked:
 	// reset because cleanupInteractiveState may remove the early placeholder.
 	e.ensureInteractiveStateForQueueing(interactiveKey, p, msg.ReplyCtx)
 	e.noteUserMessageAccepted(interactiveKey, msg.UserMessageTimeMs)
+	runMessageAccepted(msg)
 	slog.Debug("user message accepted for processing",
 		"platform", msg.Platform,
 		"session", msg.SessionKey,
@@ -3014,6 +3092,15 @@ sessionLocked:
 	)
 
 	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
+}
+
+func runMessageAccepted(msg *Message) {
+	if msg == nil || msg.OnAccepted == nil {
+		return
+	}
+	callback := msg.OnAccepted
+	msg.OnAccepted = nil
+	callback()
 }
 
 func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions *SessionManager, interactiveKey string, session *Session) *Session {
@@ -3034,6 +3121,23 @@ func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions 
 	lastActive := session.GetLastUserActivity()
 	if lastActive.IsZero() {
 		lastActive = session.GetUpdatedAt()
+	}
+	// Issue #1731: when the user has explicitly chosen this session via
+	// /switch (or any other intentional selection), the idle baseline is the
+	// explicit-activation time, not the last message in the session — otherwise
+	// the first message after /switch into a long-idle session would be
+	// wrongly rotated away. ExplicitActivationTTL caps how long that
+	// exemption can last so a long-abandoned session cannot permanently
+	// occupy the active slot.
+	if explicitAt := session.GetExplicitActivatedAt(); !explicitAt.IsZero() {
+		switch {
+		case lastActive.IsZero() || explicitAt.After(lastActive):
+			lastActive = explicitAt
+		case time.Since(explicitAt) > ExplicitActivationTTL:
+			// Explicit activation has expired — fall back to the standard
+			// idle baseline so the session can finally be rotated.
+			// lastActive is already set above.
+		}
 	}
 	if lastActive.IsZero() || time.Since(lastActive) < e.resetOnIdle {
 		return nil
@@ -3127,6 +3231,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		channelKey:        msg.ChannelKey,
 		userMessageTimeMs: msg.UserMessageTimeMs,
 	})
+	runMessageAccepted(msg)
 	queueDepth := len(state.pendingMessages)
 
 	slog.Debug("user message accepted into queue",
@@ -3751,7 +3856,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 			sendDone <- fmt.Errorf("agent session became nil")
 			return
 		}
-		sendDone <- as.Send(promptContent, msg.Images, msg.Files)
+		sendDone <- as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
 	}()
 
 	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx)
@@ -3760,23 +3865,29 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	}
 	stopTyping = nil // ownership transferred; prevent defer from double-stopping
 
-	// Guard against a narrow race: a message may have been queued between
-	// processInteractiveEvents observing an empty queue and returning here
-	// (session is still locked, so handleMessage's TryLock fails and routes
-	// the message to queueMessageForBusySession). Drain any such orphans.
-	if e.drainPendingMessages(state, session, sessions, interactiveKey) {
-		unlocked = true
-	}
-
-	// Start unsolicited reader if the session is still alive and the last
-	// turn ended cleanly. This goroutine will consume agent-initiated events
-	// (e.g. background task completions) and relay them to the platform.
+	// Start unsolicited reader and arm the idle close timer BEFORE draining
+	// queued messages. drainPendingMessages releases the session lock, and
+	// without this ordering the next user message can race in, call
+	// cancelAgentSessionIdleClose (a no-op since nothing was scheduled yet),
+	// and then the late schedule below arms a timer that no subsequent cancel
+	// will catch — closing the live session mid-turn. See #1686 P1-C P1-2.
+	// The schedule's own state checks (agentSession nil, stopped, etc.) and
+	// cleanupInteractiveStateForIdleToken's stale-token guard make it safe to
+	// leave a scheduled timer running across drain.
 	state.mu.Lock()
 	alive := state.agentSession != nil && state.agentSession.Alive() && !state.stopped && !state.eventsNeedResync
 	state.mu.Unlock()
 	if alive {
 		e.startUnsolicitedReader(state, session, sessions, interactiveKey, workspaceDir)
 		e.scheduleAgentSessionIdleClose(interactiveKey, state)
+	}
+
+	// Guard against a narrow race: a message may have been queued between
+	// processInteractiveEvents observing an empty queue and returning here
+	// (session is still locked, so handleMessage's TryLock fails and routes
+	// the message to queueMessageForBusySession). Drain any such orphans.
+	if e.drainPendingMessages(state, session, sessions, interactiveKey) {
+		unlocked = true
 	}
 }
 
@@ -3922,6 +4033,12 @@ func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
 // When agentOverride is non-nil it is used instead of e.agent to start the session.
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY env injection; otherwise sessionKey is used.
 func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string) *interactiveState {
+	// /stop removes the state from the map immediately but tears the process
+	// down in the background. Wait that teardown out *before* taking the lock:
+	// spawning now would start a second process on the same agent session ID
+	// while the first one is still alive and writing to the same transcript.
+	closeSettled := e.awaitSessionClose(sessionKey)
+
 	e.interactiveMu.Lock()
 	defer e.interactiveMu.Unlock()
 
@@ -3952,7 +4069,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		state.markStopped()
 		// Close synchronously to prevent race condition where old agent
 		// continues outputting while new agent starts (issue #327).
-		e.closeAgentSessionWithTimeout(sessionKey, state.agentSession)
+		e.closeAgentSessionWithTimeout(sessionKey, state.agentSession, state.platform, state.replyCtx)
 		delete(e.interactiveStates, sessionKey)
 		ok = false // prevent reading stale settings below
 	}
@@ -4036,6 +4153,19 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 			startSessionID = ""
 		}
 	}
+	// Refuse to resume when the previous process could not be confirmed dead
+	// (close reported a kill failure, timed out, or we gave up waiting for it).
+	// Starting fresh loses this conversation's history, but resuming would put
+	// two live agents on one transcript — both replying, both calling tools.
+	if startSessionID != "" && (!closeSettled || e.consumeUnsafeResume(sessionKey)) {
+		slog.Warn("previous agent process not confirmed dead, starting a fresh session instead of resuming",
+			"session_key", sessionKey, "abandoned_session_id", startSessionID)
+		session.SetAgentSessionID("", agent.Name())
+		sessions.Save()
+		startSessionID = ""
+		e.send(p, replyCtx, e.i18n.T(MsgSessionResumeUnsafe))
+	}
+
 	isResume := startSessionID != ""
 	startAt := time.Now()
 	agentSession, err := agent.StartSession(e.ctx, startSessionID)
@@ -4149,10 +4279,14 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 	// Capture the agent session and nil it out atomically to prevent a
 	// concurrent cleanup (without expected) from closing the same session.
 	var agentSession AgentSession
+	var closePlatform Platform
+	var closeReplyCtx any
 	if ok && state != nil {
 		state.mu.Lock()
 		agentSession = state.agentSession
 		state.agentSession = nil
+		closePlatform = state.platform
+		closeReplyCtx = state.replyCtx
 		if state.agentSessionIdleCancel != nil {
 			state.agentSessionIdleCancel()
 			state.agentSessionIdleCancel = nil
@@ -4186,7 +4320,7 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 	// an empty map and reports "No execution in progress" while
 	// the agent session Close() is still blocking (up to 130s).
 	if agentSession != nil {
-		e.closeAgentSessionWithTimeout(sessionKey, agentSession)
+		e.closeAgentSessionWithTimeout(sessionKey, agentSession, closePlatform, closeReplyCtx)
 	}
 
 	// Now delete the state from the map after the session is closed.
@@ -4281,6 +4415,8 @@ func (e *Engine) cleanupInteractiveStateForIdleToken(sessionKey string, expected
 	state.agentSession = nil
 	state.agentSessionIdleCancel = nil
 	state.agentSessionIdleToken = 0
+	closePlatform := state.platform
+	closeReplyCtx := state.replyCtx
 	state.mu.Unlock()
 	e.interactiveMu.Unlock()
 
@@ -4298,7 +4434,7 @@ func (e *Engine) cleanupInteractiveStateForIdleToken(sessionKey string, expected
 	}
 	e.notifyDroppedQueuedMessages(state, fmt.Errorf("session reset"))
 
-	e.closeAgentSessionWithTimeout(sessionKey, agentSession)
+	e.closeAgentSessionWithTimeout(sessionKey, agentSession, closePlatform, closeReplyCtx)
 
 	e.interactiveMu.Lock()
 	if currentState, currentOk := e.interactiveStates[sessionKey]; currentOk && currentState == expected {
@@ -4307,43 +4443,193 @@ func (e *Engine) cleanupInteractiveStateForIdleToken(sessionKey string, expected
 	e.interactiveMu.Unlock()
 }
 
-func (e *Engine) closeAgentSessionAsync(sessionKey string, agentSession AgentSession) {
-	if agentSession == nil {
-		return
+// beginSessionClose registers an in-flight teardown for sessionKey and returns
+// the function that must be called once the teardown is over. Spawns for the
+// same key wait on this registration (awaitSessionClose), so a new agent
+// process is never started while the previous one may still be alive.
+func (e *Engine) beginSessionClose(sessionKey string) func() {
+	if sessionKey == "" {
+		return func() {}
 	}
-	go e.closeAgentSessionWithTimeout(sessionKey, agentSession)
+	done := make(chan struct{})
+	e.closingMu.Lock()
+	if e.closingSessions == nil {
+		e.closingSessions = make(map[string]chan struct{})
+	}
+	e.closingSessions[sessionKey] = done
+	e.closingMu.Unlock()
+
+	return func() {
+		e.closingMu.Lock()
+		// Only clear the registry if it still points at *this* teardown; an
+		// overlapping close may have replaced it and is still running.
+		if cur, ok := e.closingSessions[sessionKey]; ok && cur == done {
+			delete(e.closingSessions, sessionKey)
+		}
+		e.closingMu.Unlock()
+		close(done)
+	}
 }
 
-func (e *Engine) closeAgentSessionWithTimeout(sessionKey string, agentSession AgentSession) {
+// awaitSessionClose blocks until no teardown is in flight for sessionKey.
+// It reports whether the wait ended cleanly; false means the previous process
+// could not be confirmed gone, in which case the caller must not resume its
+// agent session ID. Must NOT be called while holding interactiveMu — the
+// teardown itself can take up to closeTimeout.
+func (e *Engine) awaitSessionClose(sessionKey string) bool {
+	if sessionKey == "" {
+		return true
+	}
+	// Budget slightly above the teardown's own ceiling so the close path
+	// always gets to resolve (and flag the session) before we give up.
+	deadline := time.After(closeTimeout + 30*time.Second)
+	start := time.Now()
+	waited := false
+	for {
+		e.closingMu.Lock()
+		done := e.closingSessions[sessionKey]
+		e.closingMu.Unlock()
+		if done == nil {
+			if waited {
+				slog.Info("previous session teardown finished, starting new session",
+					"session_key", sessionKey, "waited", time.Since(start))
+			}
+			return true
+		}
+		if !waited {
+			waited = true
+			slog.Info("waiting for previous session teardown before spawning",
+				"session_key", sessionKey)
+		}
+		select {
+		case <-done:
+			// Loop again: an overlapping teardown may have been registered.
+		case <-deadline:
+			slog.Error("timed out waiting for previous session teardown; refusing to resume its agent session",
+				"session_key", sessionKey, "waited", time.Since(start))
+			return false
+		case <-e.ctx.Done():
+			return false
+		}
+	}
+}
+
+// markUnsafeResume records that sessionKey's previous agent process could not
+// be confirmed dead, so its agent session ID must not be resumed. Resuming it
+// would attach a second live process to the same conversation — both would
+// read and write the same transcript and act on it independently.
+func (e *Engine) markUnsafeResume(sessionKey string) {
+	if sessionKey == "" {
+		return
+	}
+	e.closingMu.Lock()
+	if e.unsafeResume == nil {
+		e.unsafeResume = make(map[string]bool)
+	}
+	e.unsafeResume[sessionKey] = true
+	e.closingMu.Unlock()
+}
+
+// consumeUnsafeResume reports (and clears) whether the next spawn for
+// sessionKey must start a fresh agent session instead of resuming.
+func (e *Engine) consumeUnsafeResume(sessionKey string) bool {
+	if sessionKey == "" {
+		return false
+	}
+	e.closingMu.Lock()
+	defer e.closingMu.Unlock()
+	if !e.unsafeResume[sessionKey] {
+		return false
+	}
+	delete(e.unsafeResume, sessionKey)
+	return true
+}
+
+func (e *Engine) closeAgentSessionAsync(sessionKey string, agentSession AgentSession, platform Platform, replyCtx any) {
 	if agentSession == nil {
 		return
 	}
+	// Register synchronously: a message arriving right after /stop must see
+	// the teardown even if this goroutine has not been scheduled yet.
+	finish := e.beginSessionClose(sessionKey)
+	go func() {
+		defer finish()
+		e.closeAgentSession(sessionKey, agentSession, platform, replyCtx)
+	}()
+}
 
-	// Allow enough time for the agent's own graceful shutdown sequence:
-	// stdin close → Stop hooks (claude-mem summary etc.) → SIGTERM → SIGKILL.
-	// Claude Code's Stop hooks can take up to 120s (claude-mem uses a
-	// sonnet summarizer). The 130s budget covers the default 120s graceful
-	// phase + 5s SIGTERM + 5s buffer. The wait ends early if the process
-	// exits sooner — this is the ceiling, not the typical duration.
-	const closeTimeout = 130 * time.Second
+// closeAgentSessionWithTimeout tears down agentSession in the background and
+// waits up to closeTimeout for it to finish. platform/replyCtx (the chat that
+// owned the session, if known) are used to alert the user if the underlying
+// OS process cannot be confirmed dead — either because Close() itself
+// reports a kill failure, or because it does not return within the budget
+// at all. In both cases the process may still be running with the session's
+// original credentials, so silence here is worse than a noisy warning.
+func (e *Engine) closeAgentSessionWithTimeout(sessionKey string, agentSession AgentSession, platform Platform, replyCtx any) {
+	if agentSession == nil {
+		return
+	}
+	finish := e.beginSessionClose(sessionKey)
+	defer finish()
+	e.closeAgentSession(sessionKey, agentSession, platform, replyCtx)
+}
+
+// closeAgentSession performs the teardown itself. Callers must have registered
+// the in-flight close (beginSessionClose) first.
+func (e *Engine) closeAgentSession(sessionKey string, agentSession AgentSession, platform Platform, replyCtx any) {
+	if agentSession == nil {
+		return
+	}
 
 	slog.Debug("cleanupInteractiveState: closing agent session", "session", sessionKey)
 	closeStart := time.Now()
 
 	done := make(chan struct{})
+	var closeErr error
 	go func() {
-		agentSession.Close()
+		closeErr = agentSession.Close()
 		close(done)
 	}()
 
 	select {
 	case <-done:
+		if closeErr != nil {
+			slog.Error("agent session close reported failure, process may still be running",
+				"session", sessionKey, "error", closeErr)
+			// The old process may still hold this conversation open — the
+			// next turn must not resume into it.
+			e.markUnsafeResume(sessionKey)
+			e.notifySessionCloseFailure(sessionKey, platform, replyCtx, closeErr)
+			return
+		}
 		if elapsed := time.Since(closeStart); elapsed >= slowAgentClose {
 			slog.Warn("slow agent session close", "elapsed", elapsed, "session", sessionKey)
 		}
 	case <-time.After(closeTimeout):
 		slog.Error("agent session close timed out, abandoning",
 			"timeout", closeTimeout, "session", sessionKey)
+		e.markUnsafeResume(sessionKey)
+		e.notifySessionCloseFailure(sessionKey, platform, replyCtx,
+			fmt.Errorf("did not respond within %s", closeTimeout))
+	}
+}
+
+// notifySessionCloseFailure alerts the chat that owned a session when its
+// underlying process could not be confirmed killed. Without this, a stuck
+// process can keep running in the background — still holding the session's
+// credentials — while the user believes /stop (or /new) already ended it.
+func (e *Engine) notifySessionCloseFailure(sessionKey string, platform Platform, replyCtx any, cause error) {
+	if platform == nil || replyCtx == nil {
+		slog.Error("agent session close failed and no chat is available to alert",
+			"session", sessionKey, "cause", cause)
+		return
+	}
+	text := e.i18n.T(MsgSessionCloseFailed) + fmt.Sprintf(" (%v)", cause)
+	if err := e.waitOutgoing(platform); err != nil {
+		slog.Warn("notifySessionCloseFailure: wait outgoing failed", "session", sessionKey, "error", err)
+	}
+	if err := platform.Send(e.ctx, replyCtx, text); err != nil {
+		slog.Error("notifySessionCloseFailure: send failed", "session", sessionKey, "error", err)
 	}
 }
 
@@ -4568,7 +4854,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				}
 
 				if fullResponse != "" {
-					for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
+					for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
 						e.send(p, replyCtx, chunk)
 					}
 				}
@@ -4597,6 +4883,14 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				state.mu.Lock()
 				state.eventsNeedResync = false
 				state.mu.Unlock()
+
+				// Reset the per-session idle close timer so a series of
+				// background task completions does not get cut short by the
+				// idle timeout armed at the end of the last foreground turn.
+				// Without this, a long-running background turn (e.g. cron task
+				// that reports progress every minute) can be killed mid-flight
+				// when the original idle timer fires. See #1686 P1-C P1-1.
+				e.scheduleAgentSessionIdleClose(sessionKey, state)
 
 				slog.Info("unsolicited turn complete",
 					"session", sessionKey,
@@ -4967,7 +5261,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					} else {
 						segment := strings.Join(textParts[segmentStart:], "")
 						if segment != "" {
-							for _, chunk := range splitMessage(segment, maxPlatformMessageLen) {
+							for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
 								sendWorkspace(p, replyCtx, chunk)
 							}
 						}
@@ -4990,7 +5284,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					if !previewActive {
 						segment := strings.Join(textParts[segmentStart:], "")
 						if segment != "" {
-							for _, chunk := range splitMessage(segment, maxPlatformMessageLen) {
+							for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
 								sendWorkspace(p, replyCtx, chunk)
 							}
 						}
@@ -5054,7 +5348,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					} else {
 						segment := strings.Join(textParts[segmentStart:], "")
 						if segment != "" {
-							for _, chunk := range splitMessage(segment, maxPlatformMessageLen) {
+							for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
 								sendWorkspace(p, replyCtx, chunk)
 							}
 						}
@@ -5098,7 +5392,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					if !previewActive {
 						segment := strings.Join(textParts[segmentStart:], "")
 						if segment != "" {
-							for _, chunk := range splitMessage(segment, maxPlatformMessageLen) {
+							for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
 								sendWorkspace(p, replyCtx, chunk)
 							}
 						}
@@ -5128,7 +5422,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				}
 				toolMsg := fmt.Sprintf(e.i18n.T(MsgTool), toolCount, event.ToolName, formattedInput)
-				if !cp.AppendEvent(ProgressEntryToolUse, toolInput, event.ToolName, toolMsg) {
+				// Truncate the tool input that goes into the progress card payload so
+				// tool_max_len applies uniformly to progress_style=card, matching
+				// the rich-card path. event.ToolInput itself is left untouched.
+				cardToolInput := truncateIf(toolInput, e.display.ToolMaxLen)
+				if !cp.AppendEvent(ProgressEntryToolUse, cardToolInput, event.ToolName, toolMsg) {
 					for _, chunk := range SplitMessageCodeFenceAware(toolMsg, maxPlatformMessageLen) {
 						sendWorkspace(p, replyCtx, chunk)
 					}
@@ -5346,7 +5644,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if !previewActive {
 					segment := strings.Join(textParts[segmentStart:], "")
 					if segment != "" {
-						for _, chunk := range splitMessage(segment, maxPlatformMessageLen) {
+						for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
 							sendWorkspace(p, replyCtx, chunk)
 						}
 					}
@@ -5480,10 +5778,21 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			contextEstimate := estimateTokensWithPendingAssistant(session.GetHistory(0), baseResponse)
 
-			// Evaluate auto-compress trigger (token estimate on user+assistant text,
-			// including this turn's assistant reply before it is appended to history).
+			// Evaluate auto-compress trigger.
+			//
+			// Prefer the agent's actual API-reported input tokens when the session
+			// implements ContextUsageReporter — the text-only heuristic misses
+			// tool_use/tool_result blocks (~70-85% of context) and the fixed overhead
+			// of system prompt + tools + skills (issue #1115). The real number is the
+			// size of the last assistant event's prompt: input + cache_creation +
+			// cache_read (the three are disjoint subsets that sum to the full prompt,
+			// per Anthropic's usage semantics), which already includes everything
+			// the model will see on the next inference call.
 			if e.autoCompressEnabled && e.autoCompressMaxTokens > 0 {
 				estimate := contextEstimate
+				if usage := replyFooterSessionContextUsage(state.agentSession); usage != nil && usage.UsedTokens > 0 {
+					estimate = usage.UsedTokens
+				}
 				now := time.Now()
 				state.mu.Lock()
 				last := state.lastAutoCompressAt
@@ -5611,7 +5920,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					// Fallback: send the response as a normal message — but never
 					// for a silent reply, which has no deliverable content.
 					if !isSilent {
-						for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
+						for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
 							if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
 								return
 							}
@@ -5844,7 +6153,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						nextSend <- fmt.Errorf("agent session became nil")
 						return
 					}
-					nextSend <- as.Send(queuedPrompt, queued.images, queued.files)
+					nextSend <- as.Send(queuedPrompt, queued.messageID, queued.images, queued.files)
 				}()
 				pendingSend = nextSend
 
@@ -6034,7 +6343,7 @@ channelClosed:
 			if segmentStart < len(textParts) {
 				unsent := strings.Join(textParts[segmentStart:], "")
 				if unsent != "" {
-					for _, chunk := range splitMessage(unsent, maxPlatformMessageLen) {
+					for _, chunk := range SplitMessageCodeFenceAware(unsent, maxPlatformMessageLen) {
 						if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
 							return
 						}
@@ -6044,7 +6353,7 @@ channelClosed:
 		} else if sp.finish(fullResponse, "") {
 			slog.Debug("stream preview: finalized in-place (process exited)")
 		} else {
-			for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
+			for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
 				if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
 					return
 				}
@@ -6172,7 +6481,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 				sendDone <- fmt.Errorf("agent session became nil")
 				return
 			}
-			sendDone <- as.Send(prompt, queued.images, queued.files)
+			sendDone <- as.Send(prompt, queued.messageID, queued.images, queued.files)
 		}()
 
 		var stopTyping func()
@@ -6263,7 +6572,7 @@ func (e *Engine) cmdPs(p Platform, msg *Message, args []string) {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsNoSession))
 		return
 	}
-	if err := state.agentSession.Send(text, nil, nil); err != nil {
+	if err := state.agentSession.Send(text, "", nil, nil); err != nil {
 		slog.Error("ps: send failed", "error", err)
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsSendFailed))
 		return
@@ -6379,7 +6688,7 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		return true
 	}
 
-	if cmdID != "" && privilegedCommands[cmdID] && !e.isAdmin(msg.UserID) {
+	if cmdID != "" && isPrivilegedCommandInvocation(cmdID, args) && !e.isAdmin(msg.UserID) {
 		slog.Info("audit: command_blocked",
 			"user_id", msg.UserID, "platform", msg.Platform,
 			"project", e.name, "command", cmdID, "reason", "unauthorized")
@@ -7150,7 +7459,7 @@ func (e *Engine) composeRichStatusFooter(streaming bool, turnStart time.Time, ag
 //
 // Sections (each skipped when its data is missing):
 //   - model: from session GetModel() / agent.Name()
-//   - effort: reasoning_effort (Codex / Claude high/medium/low/xhigh)
+//   - effort: reasoning_effort (Codex / Claude high/medium/low/xhigh/max)
 //   - token counts: out (output) · in (new input) · cw (cache create) · cr (cache read)
 //   - ctx %: UsedTokens / ContextWindow, capped at 100%
 //
@@ -7563,7 +7872,7 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 // which case caller should bail). sendFn is the workspace-aware send closure
 // (so the helper picks up workspace transforms like path remapping).
 func sendChunksWithStatusFooter(ctx context.Context, p Platform, replyCtx any, body, statusFooter string, sendFn func(Platform, any, string) error) bool {
-	chunks := splitMessage(body, maxPlatformMessageLen)
+	chunks := SplitMessageCodeFenceAware(body, maxPlatformMessageLen)
 	for i, chunk := range chunks {
 		isLast := i == len(chunks)-1
 		if isLast && statusFooter != "" {
@@ -8606,9 +8915,15 @@ func selectUsageWindows(report *UsageReport) (*UsageWindow, *UsageWindow) {
 			}
 		}
 		if primary == nil && len(bucket.Windows) > 0 {
-			primary = &bucket.Windows[0]
+			// Fall back to the first window when no 5-hour quota is reported
+			// (e.g. Codex accounts whose first bucket only exposes a 7-day
+			// window). Skip it if the slot is already occupied by the 7-day
+			// window so the same block is not rendered twice.
+			if secondary != &bucket.Windows[0] {
+				primary = &bucket.Windows[0]
+			}
 		}
-		if secondary == nil && len(bucket.Windows) > 1 {
+		if secondary == nil && len(bucket.Windows) > 1 && &bucket.Windows[1] != primary {
 			secondary = &bucket.Windows[1]
 		}
 		if primary != nil || secondary != nil {
@@ -8841,8 +9156,20 @@ func (e *Engine) renderDirCardSafe(sessionKey string, page int) *Card {
 func (e *Engine) renderStatusCard(sessionKey string, userID string) *Card {
 	agent, sessions := e.sessionContextForKey(sessionKey)
 	platNames := make([]string, len(e.platforms))
+	var degraded []string
 	for i, pl := range e.platforms {
-		platNames[i] = pl.Name()
+		name := pl.Name()
+		// Issue #1618: surface per-platform degraded state (e.g. Lark
+		// bot open_id unresolved) inline in the platform list and as
+		// a separate warnings block below.
+		if ph, ok := pl.(PlatformHealth); ok {
+			info := ph.PlatformHealth()
+			if info.Degraded {
+				name = fmt.Sprintf("%s ⚠️", name)
+				degraded = append(degraded, fmt.Sprintf("• %s: %s", info.Name, info.DegradedReason))
+			}
+		}
+		platNames[i] = name
 	}
 	platformStr := strings.Join(platNames, ", ")
 	if len(platNames) == 0 {
@@ -8927,6 +9254,12 @@ func (e *Engine) renderStatusCard(sessionKey string, userID string) *Card {
 		userIDStr,
 	)
 	title, body := splitCardTitleBody(statusText)
+
+	if len(degraded) > 0 {
+		// Issue #1618: surface per-platform degraded reasons so operators
+		// see them in /status (previously hidden behind a silent fail-open).
+		body += "\n\n**⚠️ Degraded**\n" + strings.Join(degraded, "\n")
+	}
 
 	return NewCard().
 		Title(title, "green").
@@ -10014,6 +10347,8 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 	pending := state.pending
 	state.pending = nil
 	agentSession := state.agentSession
+	closePlatform := state.platform
+	closeReplyCtx := state.replyCtx
 	state.mu.Unlock()
 
 	// If the agent session supports graceful turn cancellation (e.g. ACP),
@@ -10076,7 +10411,7 @@ normalCleanup:
 		state.pendingMessages = nil
 		state.mu.Unlock()
 	}
-	e.closeAgentSessionAsync(sessionKey, agentSession)
+	e.closeAgentSessionAsync(sessionKey, agentSession, closePlatform, closeReplyCtx)
 
 	e.hooks.Emit(HookEvent{
 		Event:      HookEventSessionEnded,
@@ -10161,7 +10496,7 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 	}
 
 	cmd := compressor.CompressCommand()
-	if err := state.agentSession.Send(cmd, nil, nil); err != nil {
+	if err := state.agentSession.Send(cmd, "", nil, nil); err != nil {
 		if !auto {
 			e.reply(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
 		}
@@ -11658,7 +11993,7 @@ func (e *Engine) sendAlreadyRenderedWithError(p Platform, replyCtx any, content 
 				"platform", p.Name(),
 				"error", err,
 				"content_len", len(content),
-				"hint", "user needs to send a new message to refresh context_token")
+				"hint", "user needs to send a message to the bot first so a context_token can be captured")
 		} else {
 			slog.Error("platform send failed", "platform", p.Name(), "error", err, "content_len", len(content))
 		}
@@ -15687,7 +16022,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 
 	saveRelaySessionID(agentSession.CurrentSessionID(), false)
 
-	if err := agentSession.Send(message, nil, nil); err != nil {
+	if err := agentSession.Send(message, "", nil, nil); err != nil {
 		agentSession.Close()
 		return "", fmt.Errorf("send relay message: %w", err)
 	}
@@ -15976,9 +16311,13 @@ func (e *Engine) setupMemoryFile() (setupResult, string, error) {
 
 	existing, _ := os.ReadFile(filePath)
 	existingText := string(existing)
-	block := "\n" + ccConnectInstructionMarker + "\n" + AgentSystemPrompt() + "\n"
+	// Use the engine's configured language so memory-file prompts reflect the
+	// operator's locale (Issue #1655). AgentSystemPromptForLang handles
+	// fallback to English internally when a tool key is missing.
+	prompt := AgentSystemPromptForLang(e.i18n.CurrentLang())
+	block := "\n" + ccConnectInstructionMarker + "\n" + prompt + "\n"
 	if idx := strings.Index(existingText, ccConnectInstructionMarker); idx >= 0 {
-		if strings.Contains(existingText[idx:], AgentSystemPrompt()) {
+		if strings.Contains(existingText[idx:], prompt) {
 			return setupExists, baseName, nil
 		}
 		updated := strings.TrimRight(existingText[:idx], "\n") + block
@@ -16120,6 +16459,29 @@ func effectiveWorkspaceChannelKey(msg *Message) string {
 		return workspaceChannelKey(msg.Platform, msg.ChannelKey)
 	}
 	return extractWorkspaceChannelKey(msg.SessionKey)
+}
+
+// migrateLegacyWorkspaceBindings moves bindings from a platform-provided
+// legacy channel scope to the current scope before workspace resolution. The
+// platform owns both opaque identifiers; core only adds the platform prefix.
+func (e *Engine) migrateLegacyWorkspaceBindings(msg *Message) {
+	if e.workspaceBindings == nil || msg == nil || msg.ChannelKey == "" || msg.LegacyChannelKey == "" {
+		return
+	}
+	oldChannelKey := workspaceChannelKey(msg.Platform, msg.LegacyChannelKey)
+	newChannelKey := workspaceChannelKey(msg.Platform, msg.ChannelKey)
+	if oldChannelKey == "" || newChannelKey == "" || oldChannelKey == newChannelKey {
+		return
+	}
+
+	for _, projectKey := range []string{"project:" + e.name, sharedWorkspaceBindingsKey} {
+		if e.workspaceBindings.MigrateChannelKey(projectKey, oldChannelKey, newChannelKey) {
+			slog.Info("workspace binding migrated",
+				"project", projectKey,
+				"old_channel_key", oldChannelKey,
+				"new_channel_key", newChannelKey)
+		}
+	}
 }
 
 // commandContext resolves the appropriate agent, session manager, and interactive key
