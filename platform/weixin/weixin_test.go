@@ -369,7 +369,7 @@ func TestPollLoop_DispatchInboundFalseCachesTokenWithoutHandlingMessage(t *testi
 		accountLabel:           "default",
 		dispatchInboundEnabled: false,
 		httpClient:             &http.Client{},
-		dedup:                  make(map[string]time.Time),
+		dedup:                  core.NewMessageDedup(5 * time.Minute),
 		tokens:                 make(map[string]string),
 		typingTickets:          make(map[string]typingTicketEntry),
 	}
