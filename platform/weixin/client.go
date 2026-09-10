@@ -14,6 +14,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/chenhg5/cc-connect/core"
 )
 
 const (
@@ -42,7 +44,7 @@ func newAPIClient(baseURL, token, routeTag string, httpClient *http.Client) *api
 	}
 	baseURL = strings.TrimRight(baseURL, "/") + "/"
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: defaultAPITimeout}
+		httpClient = &http.Client{Timeout: defaultAPITimeout, Transport: core.HardenTransport(nil)}
 	}
 	return &apiClient{
 		baseURL:    baseURL,
@@ -58,8 +60,8 @@ func (c *apiClient) longPollClient(timeout time.Duration) *http.Client {
 	}
 	tr := http.DefaultTransport
 	if t, ok := http.DefaultTransport.(*http.Transport); ok {
-		cloned := t.Clone()
-		tr = cloned
+		// 长轮询是 ilink 入站主链路，必须一起吃显式 RootCAs（2026-09-10 code）。
+		tr = core.HardenTransport(t.Clone())
 	}
 	return &http.Client{
 		Timeout:   timeout + 5*time.Second,

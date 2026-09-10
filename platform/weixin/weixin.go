@@ -170,6 +170,16 @@ func sanitizePathSegment(s string) string {
 	return b.String()
 }
 
+// cdnUTLSConfig 返回微信 CDN 直连用的 uTLS 配置：Chrome 指纹（绕 CDN 的 JA3 拒绝，
+// 2026-08-12）+ 显式 RootCAs（2026-09-10：跳过 macOS 平台校验器，见 core/tlsroot.go）。
+func cdnUTLSConfig(host string) *utls.Config {
+	return &utls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: false,
+		RootCAs:            core.ExtraRootCAs(),
+	}
+}
+
 // New constructs a Weixin platform. Required options: token.
 // Optional: base_url, cdn_base_url (default https://novac2c.cdn.weixin.qq.com/c2c), allow_from, route_tag, account_id, long_poll_timeout_ms,
 // dispatch_inbound (default true; false keeps polling only to refresh outbound context tokens),
@@ -220,7 +230,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		stateDir = strings.TrimSpace(override)
 	}
 
-	httpClient := &http.Client{Timeout: defaultAPITimeout}
+	httpClient := &http.Client{Timeout: defaultAPITimeout, Transport: core.HardenTransport(nil)}
 	if proxyURL, _ := opts["proxy"].(string); proxyURL != "" {
 		u, err := url.Parse(proxyURL)
 		if err != nil {
@@ -231,7 +241,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		if proxyUser != "" {
 			u.User = url.UserPassword(proxyUser, proxyPass)
 		}
-		httpClient.Transport = &http.Transport{Proxy: http.ProxyURL(u)}
+		httpClient.Transport = core.HardenTransport(&http.Transport{Proxy: http.ProxyURL(u)})
 		slog.Info("weixin: using proxy", "proxy", u.Redacted())
 	}
 
@@ -251,10 +261,7 @@ func New(opts map[string]any) (core.Platform, error) {
 				if err != nil {
 					host = addr
 				}
-				uConn := utls.UClient(rawConn, &utls.Config{
-					ServerName:         host,
-					InsecureSkipVerify: false,
-				}, utls.HelloChrome_120)
+				uConn := utls.UClient(rawConn, cdnUTLSConfig(host), utls.HelloChrome_120)
 				if err := uConn.HandshakeContext(ctx); err != nil {
 					rawConn.Close()
 					return nil, err
