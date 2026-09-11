@@ -95,4 +95,19 @@ launchctl kickstart -k gui/$(id -u)/com.cc-connect.service
 
 本机 `~/skills/bot/scripts/tls-trust-watch.py`（cron `tlstrust1`，每 30 分钟）负责
 「证书轮换 / 信任层再拒」的检出与提醒；`~/skills/bot/bin/tls-trust-probe` 是它用的 Go 双模探针。
-运维口径见 `~/skills/bot/SKILL.md`「通道故障排查」。
+
+探针默认拨 **三条独立信任链**（2026-09-11 补第三条）：
+`ilinkai.weixin.qq.com`（bot API）、`open.feishu.cn`（飞书）、
+`novac2c.cdn.weixin.qq.com`（微信 CDN —— 媒体/文件收发）。
+第三条是补的盲区：09-10 只给 ilink + 飞书上了 keychain 例外，**CDN 叶子
+（CN=`cdn.weixin.qq.com`，GlobalSign）是另一条链、照样被 Apple CT 策略拒**，
+结果 09-10 18:26 起**文件/媒体出站 100% 失败**（`weixin: CDN upload request failed`）
+而文字推送正常，一天无人发现；直到 09-11 由工单 `t_e6c34162` 定位。
+→ 结论不变且更强：**keychain 例外是逐条链的临时兜底，只有本补丁（显式 RootCAs）
+才是把「所有未来主机/轮换」一次覆盖的根治方案**。
+
+另记（2026-09-11 实测）：`security add-trusted-cert` **需要 GUI 授权**，
+在 headless/cron/agent 子进程里执行只会拿到
+`SecTrustSettingsSetTrustSettings: The authorization was canceled by the user.`；
+即「加 keychain 例外」这条路 **agent 自己走不通**，只能请高律师在 Terminal.app 敲一行，
+或直接部署本补丁（部署步骤见第 4 节，重启同样需高律师择时）。

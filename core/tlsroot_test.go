@@ -110,7 +110,11 @@ func TestHardenedTransportLiveUpstreams(t *testing.T) {
 	if os.Getenv("TLS_LIVE_TEST") != "1" {
 		t.Skip("set TLS_LIVE_TEST=1 to hit live upstreams")
 	}
-	for _, host := range []string{"ilinkai.weixin.qq.com:443", "open.feishu.cn:443"} {
+	// CDN 主机（2026-09-11 补）：媒体/文件出站走 novac2c.cdn.weixin.qq.com，
+	// 其叶子证书（CN=cdn.weixin.qq.com, GlobalSign）与 ilink 是**两条独立信任链**，
+	// Apple CT 策略也会单独拒它（实测「certificate is not standards compliant」），
+	// 09-10 上了 ilink/feishu 的 keychain 例外也不覆盖它 → 文件推送 100% 失败。
+	for _, host := range []string{"ilinkai.weixin.qq.com:443", "open.feishu.cn:443", "novac2c.cdn.weixin.qq.com:443"} {
 		client := &http.Client{Transport: HardenTransport(nil), Timeout: 15 * time.Second}
 		resp, err := client.Get("https://" + host + "/ping-probe")
 		if err != nil {
