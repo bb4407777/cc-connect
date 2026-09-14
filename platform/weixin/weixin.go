@@ -665,6 +665,9 @@ func (p *Platform) dispatchInbound(ctx context.Context, m *weixinMessage, h core
 		Files:      files,
 		Audio:      audio,
 		ReplyCtx:   rc,
+		// 2026-09-14 高律师令（对齐 Hermes message_timestamps）：微信无服务端时间戳，
+		// 用入站接收时刻=最接近发送时刻的取得到；进模型前缀由 engine.buildSenderPrompt 负责。
+		UserMessageTimeMs: time.Now().UnixMilli(),
 	})
 }
 

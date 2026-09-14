@@ -3837,7 +3837,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		drainEvents(state.agentSession.Events())
 	}
 
-	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
+	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey, msg.UserMessageTimeMs)
 
 	sendStart := time.Now()
 	state.mu.Lock()
@@ -6141,7 +6141,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				}
 
-				queuedPrompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
+				queuedPrompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey, queued.userMessageTimeMs)
 
 				state.mu.Lock()
 				as := state.agentSession // capture under lock to avoid race with cleanup
@@ -6460,7 +6460,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.mu.Unlock()
 
 		e.i18n.DetectAndSet(queued.content)
-		prompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
+		prompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey, queued.userMessageTimeMs)
 
 		state.mu.Lock()
 		as := state.agentSession // capture under lock to avoid race with cleanup (mirrors #1436)
@@ -16364,9 +16364,17 @@ func (e *Engine) cmdBindSetup(p Platform, msg *Message) {
 // injectSender is enabled and userID is non-empty. When userName is available
 // it is included as sender_name so the agent can identify who sent the message
 // by display name (useful in shared channel sessions with multiple users).
-func (e *Engine) buildSenderPrompt(content, userID, userName, platform, sessionKey, channelKey string) string {
+//
+// 2026-09-14 高律师令（对齐 Hermes gateway.message_timestamps）：userMessageTimeMs
+// 非零时在内容最前加发送时刻前缀 [Mon 2006-01-02 15:04:05 CST]——时间戳来自消息
+// 元数据（微信=入站接收时刻，飞书=平台 create_time），排队等待不影响戳值。
+func (e *Engine) buildSenderPrompt(content, userID, userName, platform, sessionKey, channelKey string, userMessageTimeMs int64) string {
+	prefix := ""
+	if userMessageTimeMs > 0 {
+		prefix = time.UnixMilli(userMessageTimeMs).Local().Format("[Mon 2006-01-02 15:04:05 MST] ")
+	}
 	if !e.injectSender || userID == "" {
-		return content
+		return prefix + content
 	}
 	chatID := channelKey
 	if chatID == "" {
@@ -16374,9 +16382,9 @@ func (e *Engine) buildSenderPrompt(content, userID, userName, platform, sessionK
 	}
 	if userName != "" {
 		safeName := strings.NewReplacer(`"`, `'`, "\n", " ", "\r", "").Replace(userName)
-		return fmt.Sprintf("[cc-connect sender_id=%s sender_name=\"%s\" platform=%s chat_id=%s]\n%s", userID, safeName, platform, chatID, content)
+		return fmt.Sprintf("%s[cc-connect sender_id=%s sender_name=\"%s\" platform=%s chat_id=%s]\n%s", prefix, userID, safeName, platform, chatID, content)
 	}
-	return fmt.Sprintf("[cc-connect sender_id=%s platform=%s chat_id=%s]\n%s", userID, platform, chatID, content)
+	return fmt.Sprintf("%s[cc-connect sender_id=%s platform=%s chat_id=%s]\n%s", prefix, userID, platform, chatID, content)
 }
 
 func extractChannelID(sessionKey string) string {
