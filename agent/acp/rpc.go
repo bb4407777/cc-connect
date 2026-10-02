@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type rpcOutcome struct {
@@ -200,6 +202,26 @@ func (t *transport) call(ctx context.Context, method string, params any) (json.R
 		}
 		return out.result, nil
 	}
+}
+
+// callTimeout is call bounded by its own deadline. Handshake RPCs
+// (initialize / authenticate / session/load / session/new) use it so a
+// wedged or absent backend cannot leave newACPSession blocked forever:
+// the caller's ctx is the process lifetime, which only fires on
+// shutdown, so without an explicit deadline a single unread response
+// pins the whole interactive session in limbo — no error surfaced, no
+// reply sent to the user.
+func (t *transport) callTimeout(ctx context.Context, timeout time.Duration, method string, params any) (json.RawMessage, error) {
+	if timeout <= 0 {
+		return t.call(ctx, method, params)
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	res, err := t.call(cctx, method, params)
+	if err != nil && errors.Is(err, context.DeadlineExceeded) {
+		return nil, fmt.Errorf("acp: %s timed out after %s: %w", method, timeout, err)
+	}
+	return res, err
 }
 
 func (t *transport) sendNotification(method string, params any) error {

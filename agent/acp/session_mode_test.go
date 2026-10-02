@@ -310,6 +310,8 @@ func newTestSession(t *testing.T, cb sessionCallbacks) (*acpSession, *io.PipeWri
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.alive.Store(true)
+	// The helper models an already-established session, i.e. post-handshake.
+	s.consumerReady.Store(true)
 	s.acpSessID = "test-session-id"
 	s.tr = newTransport(rResp, wReq, s.onNotification, s.onServerRequest)
 	go s.tr.readLoop(s.ctx)

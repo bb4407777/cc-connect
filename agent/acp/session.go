@@ -22,6 +22,15 @@ import (
 // roughly half the map (iteration order is arbitrary) to bound memory.
 const toolInputCacheMaxEntries = 1000
 
+// Handshake RPC deadlines. These exist to break a hard wedge (a backend
+// that accepts a request but never answers it), not to police latency:
+// session/load replays the entire transcript before it responds, which
+// on a long conversation legitimately takes seconds.
+const (
+	handshakeTimeout  = 90 * time.Second
+	modeSwitchTimeout = 15 * time.Second
+)
+
 type acpSession struct {
 	workDir string
 	events  chan core.Event
@@ -29,6 +38,11 @@ type acpSession struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	alive   atomic.Bool
+
+	// consumerReady flips to true once newACPSession has returned and
+	// the engine is about to drain events. Until then nobody reads the
+	// channel, so emit must never block on it — see emit().
+	consumerReady atomic.Bool
 
 	cmd *exec.Cmd
 	tr  *transport
@@ -155,6 +169,11 @@ func newACPSession(ctx context.Context, cfg acpSessionConfig) (*acpSession, erro
 		}
 	}
 
+	// Handshake is done and we are about to hand the session to the
+	// engine, which starts draining s.events. From here on emit may
+	// block briefly to guarantee delivery of lifecycle events.
+	s.consumerReady.Store(true)
+
 	return s, nil
 }
 
@@ -176,7 +195,7 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 			"version": "1.0.0",
 		},
 	}
-	res, err := s.tr.call(s.ctx, "initialize", initParams)
+	res, err := s.tr.callTimeout(s.ctx, handshakeTimeout, "initialize", initParams)
 	if err != nil {
 		return fmt.Errorf("acp: initialize: %w", err)
 	}
@@ -196,7 +215,7 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 	}
 
 	if strings.TrimSpace(authMethod) != "" {
-		if _, err := s.tr.call(s.ctx, "authenticate", map[string]any{
+		if _, err := s.tr.callTimeout(s.ctx, handshakeTimeout, "authenticate", map[string]any{
 			"methodId": authMethod,
 		}); err != nil {
 			return fmt.Errorf("acp: authenticate (%s): %w", authMethod, err)
@@ -211,16 +230,37 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 			"cwd":        s.workDir,
 			"mcpServers": []any{},
 		}
-		loadRes, err := s.tr.call(s.ctx, "session/load", loadParams)
+		loadRes, err := s.tr.callTimeout(s.ctx, handshakeTimeout, "session/load", loadParams)
 		if err != nil {
-			slog.Warn("acp: session/load failed, starting new session", "error", err)
+			// A cancelled ctx means the whole session is being torn
+			// down; anything else is a genuine load failure. Both
+			// fall through to session/new so the user still gets a
+			// working (if context-less) session.
+			slog.Warn("acp: session/load failed, starting new session",
+				"session_id", resumeSessionID, "error", err)
 		} else {
 			var lr struct {
 				SessionID string         `json:"sessionId"`
 				Modes     *acpModesBlock `json:"modes"`
 			}
-			if json.Unmarshal(loadRes, &lr) == nil && lr.SessionID != "" {
-				s.setACPSessionID(lr.SessionID)
+			if json.Unmarshal(loadRes, &lr) != nil {
+				slog.Warn("acp: session/load returned unparsable result, starting new session",
+					"session_id", resumeSessionID)
+			} else {
+				// Some ACP servers (codebuddy included) answer a
+				// successful session/load without echoing sessionId
+				// back — the response only carries models/modes/
+				// configOptions. Treating that as failure made every
+				// restart silently fork a brand-new session and drop
+				// the conversation history, so fall back to the id we
+				// asked to resume.
+				if lr.SessionID != "" {
+					s.setACPSessionID(lr.SessionID)
+				} else {
+					s.setACPSessionID(resumeSessionID)
+					slog.Debug("acp: session/load echoed no sessionId, resuming requested id",
+						"session_id", resumeSessionID)
+				}
 				s.absorbModes(lr.Modes)
 				return nil
 			}
@@ -231,7 +271,7 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 		"cwd":        s.workDir,
 		"mcpServers": []any{},
 	}
-	newRes, err := s.tr.call(s.ctx, "session/new", newParams)
+	newRes, err := s.tr.callTimeout(s.ctx, handshakeTimeout, "session/new", newParams)
 	if err != nil {
 		return fmt.Errorf("acp: session/new: %w", err)
 	}
@@ -316,7 +356,7 @@ func (s *acpSession) SetLiveMode(mode string) bool {
 		)
 		return false
 	}
-	if _, err := s.tr.call(s.ctx, "session/set_mode", map[string]any{
+	if _, err := s.tr.callTimeout(s.ctx, modeSwitchTimeout, "session/set_mode", map[string]any{
 		"sessionId": sid,
 		"modeId":    modeID,
 	}); err != nil {
@@ -460,7 +500,12 @@ func (s *acpSession) cacheToolCallInput(params json.RawMessage) {
 		input := summarizeACPToolInput(tc.Kind, tc.RawInput)
 		s.toolInputByID[tc.ToolCallID] = input
 		s.toolInputMu.Unlock()
-		slog.Info("acp: cached tool_call input", "toolCallId", tc.ToolCallID, "kind", tc.Kind, "input", input)
+		// Debug, not Info: a resumed conversation replays ~100 tool
+		// calls per turn, and this dump alone filled the 10 MiB
+		// cc-connect log (rotating away the evidence needed to debug
+		// the very incident it was spamming about). The user-visible
+		// "acp: permission request" line already carries the input.
+		slog.Debug("acp: cached tool_call input", "toolCallId", tc.ToolCallID, "kind", tc.Kind, "input", input)
 	case "tool_call_update":
 		var tc struct {
 			ToolCallID string          `json:"toolCallId"`
@@ -477,7 +522,7 @@ func (s *acpSession) cacheToolCallInput(params json.RawMessage) {
 		s.evictToolInputCacheIfNeededLocked()
 		s.toolInputByID[tc.ToolCallID] = input
 		s.toolInputMu.Unlock()
-		slog.Info("acp: cached tool_call_update input", "toolCallId", tc.ToolCallID, "input", input)
+		slog.Debug("acp: cached tool_call_update input", "toolCallId", tc.ToolCallID, "input", input)
 	}
 }
 
@@ -577,13 +622,56 @@ func (s *acpSession) handlePermissionRequest(id json.RawMessage, params json.Raw
 	}()
 }
 
+// emit hands an event to the engine's consumer.
+//
+// It must never block the transport read loop for long: dispatchLine
+// runs on the single goroutine that also reads RPC responses, so a
+// blocked emit stalls *every* pending call, including the handshake.
+//
+// That is not hypothetical. A resumed conversation makes the backend
+// replay its whole transcript as session/update notifications before it
+// answers session/load — 403 of them on one observed WeChat session,
+// against a 128-slot channel. Since the engine's consumer goroutine does
+// not exist until newACPSession returns, the 129th emit blocked forever,
+// the read loop wedged, the session/load response was never read, and
+// every inbound WeChat message went unanswered with no error logged.
+//
+// Policy:
+//   - pre-consumer (handshake): drop. This is replayed history that the
+//     engine must not forward to the IM anyway.
+//   - post-consumer, channel full: block only for lifecycle-critical
+//     events; shed streaming/replay noise instead of stalling the reader.
 func (s *acpSession) emit(ev core.Event) {
 	if ev.SessionID == "" {
 		ev.SessionID = s.currentACPSessionID()
 	}
+	// Fast path: consumer is keeping up.
 	select {
 	case s.events <- ev:
+		return
 	case <-s.ctx.Done():
+		return
+	default:
+	}
+
+	if !s.consumerReady.Load() {
+		slog.Debug("acp: dropped pre-consumer event (handshake replay)",
+			"type", ev.Type, "session_id", ev.SessionID)
+		return
+	}
+
+	switch ev.Type {
+	case core.EventError, core.EventResult, core.EventPermissionRequest:
+		// Losing these corrupts the turn lifecycle (a dropped
+		// EventResult leaves the engine waiting forever), so it is
+		// worth waiting for the consumer to catch up. Bounded by ctx.
+		select {
+		case s.events <- ev:
+		case <-s.ctx.Done():
+		}
+	default:
+		slog.Debug("acp: dropped event (channel full)",
+			"type", ev.Type, "session_id", ev.SessionID)
 	}
 }
 
