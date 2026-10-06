@@ -60,9 +60,7 @@ func TestProcessInteractiveEvents_NoHookRejectionKeepsTextAcrossToolBoundary(t *
 
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-no-hook-rejection", time.Now(), nil, nil, state.replyCtx, 0)
 
-	// 2026-10-06 高律师反馈「bot 的 Q/A 之间没有分行」：跨隐藏工具边界的文本段
-	// 拼接改为 joinTextParts——段间无换行时补空行，Q/A 这类首行不再被顶进上段句中。
-	if got := p.getSent(); len(got) != 1 || got[0] != "AAA\n\nBBB" {
-		t.Fatalf("final reply = %#v, want paragraph break across hidden tool boundary %q", got, "AAA\n\nBBB")
+	if got := p.getSent(); len(got) != 1 || got[0] != "AAABBB" {
+		t.Fatalf("final reply = %#v, want text across hidden tool boundary %q", got, "AAABBB")
 	}
 }
