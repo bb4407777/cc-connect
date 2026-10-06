@@ -38,6 +38,32 @@ const defaultMaxQueuedMessages = 5 // default cap for queued messages per sessio
 // platform does not block startup logging indefinitely.
 const defaultPendingRestartTimeout = 10 * time.Second
 
+// joinTextParts merges per-turn text chunks for platforms with tool progress
+// hidden, where chunks from different assistant segments (separated by tool
+// calls) are concatenated into one message. Joining with "" can butt a later
+// segment's first line against the previous segment's last line (observed
+// 2026-10-06: a "Q：..." reply line landed mid-sentence after narration text).
+// Insert a blank line at any boundary where neither side already provides a
+// line break; boundaries that already end/start with newlines are kept as-is.
+func joinTextParts(parts []string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(parts[0])
+	for _, p := range parts[1:] {
+		if p == "" {
+			continue
+		}
+		head := b.String()
+		if head != "" && !strings.HasSuffix(head, "\n") && !strings.HasPrefix(p, "\n") {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(p)
+	}
+	return b.String()
+}
+
 // previewText truncates s to maxRunes runes for safe inclusion in debug logs.
 // Truncation uses runes (not bytes) so multi-byte characters render cleanly.
 // Newlines are replaced with literal "\n" to keep each log entry on one line.
@@ -5065,7 +5091,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 			case EventResult:
 				fullResponse := event.Content
 				if fullResponse == "" && len(textParts) > 0 {
-					fullResponse = strings.Join(textParts, "")
+					fullResponse = joinTextParts(textParts)
 				}
 
 				if fullResponse != "" {
@@ -5986,9 +6012,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// contains ALL text across tool boundaries. Prefer the full accumulated
 			// text over event.Content which only contains the last assistant segment.
 			if len(textParts) > 0 && segmentStart == 0 && !e.display.ToolMessages {
-				fullResponse = strings.Join(textParts, "")
+				fullResponse = joinTextParts(textParts)
 			} else if fullResponse == "" && len(textParts) > 0 {
-				fullResponse = strings.Join(textParts, "")
+				fullResponse = joinTextParts(textParts)
 			}
 			if fullResponse == "" {
 				fullResponse = e.i18n.T(MsgEmptyResponse)
@@ -6604,7 +6630,7 @@ channelClosed:
 		p := state.platform
 		state.mu.Unlock()
 
-		fullResponse := strings.Join(textParts, "")
+		fullResponse := joinTextParts(textParts)
 		session.AddHistory("assistant", fullResponse)
 		// Persist immediately — this path runs on abnormal channel close,
 		// so deferring the save until the next foreground turn risks losing
@@ -10868,7 +10894,7 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 				e.cleanupInteractiveState(sessionKey, state)
 				if !auto {
 					if len(textParts) > 0 {
-						e.send(p, replyCtx, strings.Join(textParts, ""))
+						e.send(p, replyCtx, joinTextParts(textParts))
 					} else {
 						e.reply(p, replyCtx, e.i18n.T(MsgCompressDone))
 					}
@@ -10924,7 +10950,7 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 		case EventResult:
 			result := event.Content
 			if result == "" && len(textParts) > 0 {
-				result = strings.Join(textParts, "")
+				result = joinTextParts(textParts)
 			}
 			if !auto {
 				if result != "" {
@@ -16416,7 +16442,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 			}
 			resp := event.Content
 			if resp == "" && len(textParts) > 0 {
-				resp = strings.Join(textParts, "")
+				resp = joinTextParts(textParts)
 			}
 			if resp == "" {
 				resp = "(empty response)"
@@ -16454,7 +16480,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 	}
 
 	if len(textParts) > 0 {
-		return strings.Join(textParts, ""), nil
+		return joinTextParts(textParts), nil
 	}
 	return "", fmt.Errorf("relay: agent process exited without response")
 }
@@ -16464,7 +16490,7 @@ func relayPartialResponseOrError(ctxErr error, textParts []string, fromProject, 
 		return "", ctxErr
 	}
 
-	resp := strings.Join(textParts, "")
+	resp := joinTextParts(textParts)
 	slog.Warn("relay: context done before final result; returning partial response",
 		"from", fromProject,
 		"to", toProject,
