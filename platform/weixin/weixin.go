@@ -975,16 +975,129 @@ func splitUTF8(s string, maxRunes int) []string {
 // fallback split (2026-10-14 高律师令「超长在句子边界自动拆条、第二条起标（续上条）」).
 const contMark = "（续上条）"
 
-// splitBubbles cuts content into semantic bubbles: one topic / one Q&A / one
-// paragraph per bubble (2026-10-20 20:17 高律师令「应该按内容切一个一个气泡」).
+// Broadcast-bubble targets (2026-10-20 20:18 高律师令「这个播报可以每隔 50~100 字
+// 左右，做个消息气泡」): accumulate digest lines, cut once a bubble reaches 50
+// runes, keep every bubble under 100.
+const (
+	bubbleBroadcastMin = 50
+	bubbleBroadcastMax = 100
+)
+
+// splitBubbles cuts a reply into Weixin message bubbles, sent back-to-back.
+//
+// A standalone divider line (3+ em dashes, e.g. —————) splits the reply into
+// the broadcast block (【后台待报】 digest, above the divider) and the body
+// (below), per 2026-10-20 20:18 高律师令「现在不是有个分割线吗？分割线上方是后台
+// 做完的播报。这个播报可以每隔 50~100 字左右，做个消息气泡，然后直接一次性回复
+// 过来。」:
+//   - broadcast: digest lines are aggregated into 50~100-rune bubbles
+//     (splitBroadcastBubbles);
+//   - the divider line itself is emitted as its own bubble so the 分割线
+//     stays visible between the two parts;
+//   - body falls through to splitBodyBubbles (blank-line / @@@ / fence / table
+//     semantics, 2026-10-20 20:17 高律师令「应该按内容切一个一个气泡」).
+//
+// Content without a divider goes straight to splitBodyBubbles. checkSendQuota
+// stays per-call in sendChunks: multiple bubbles are one logical message.
+func splitBubbles(content string) []string {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if !isBubbleDivider(line) {
+			continue
+		}
+		var out []string
+		out = append(out, splitBroadcastBubbles(lines[:i])...)
+		out = append(out, strings.TrimSpace(line))
+		out = append(out, splitBodyBubbles(strings.Join(lines[i+1:], "\n"))...)
+		return out
+	}
+	return splitBodyBubbles(content)
+}
+
+// isBubbleDivider reports whether line is a standalone divider: only em dashes,
+// 3 or more of them (————— and longer variants both match).
+func isBubbleDivider(line string) bool {
+	t := strings.TrimSpace(line)
+	if utf8.RuneCountInString(t) < 3 {
+		return false
+	}
+	for _, r := range t {
+		if r != '—' {
+			return false
+		}
+	}
+	return true
+}
+
+// splitBroadcastBubbles aggregates broadcast digest lines (one item per line)
+// into bubbles of ~50-100 runes: accumulate line by line, flush once the
+// bubble reaches bubbleBroadcastMin — preferring a cut right after sentence
+// punctuation (。；？！), deferring up to bubbleBroadcastMax when the current
+// tail has none; adding a line that would push past bubbleBroadcastMax flushes
+// first, and a single line over bubbleBroadcastMax stands alone as one bubble
+// and is never merged with neighbours.
+func splitBroadcastBubbles(lines []string) []string {
+	var out []string
+	var cur []string
+	curLen := 0
+	flush := func() {
+		if len(cur) > 0 {
+			out = append(out, strings.Join(cur, "\n"))
+			cur = nil
+			curLen = 0
+		}
+	}
+	for _, line := range lines {
+		line = strings.TrimRight(line, " \t")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if n := utf8.RuneCountInString(line); n > bubbleBroadcastMax {
+			flush() // 单条超 100 字：整行单独成泡，不与相邻行合并
+			out = append(out, line)
+			continue
+		}
+		if curLen > 0 && curLen+1+utf8.RuneCountInString(line) > bubbleBroadcastMax {
+			flush() // 再并一行会破 100 上限：先断
+		}
+		cur = append(cur, line)
+		curLen += utf8.RuneCountInString(line)
+		if len(cur) > 1 {
+			curLen++ // joiner newline
+		}
+		if curLen >= bubbleBroadcastMin && (endsWithSentencePunct(line) || curLen >= bubbleBroadcastMax) {
+			flush() // 满 50 即断；断点优先句末标点，无标点则顶到 100 上限
+		}
+	}
+	flush()
+	return out
+}
+
+// endsWithSentencePunct reports whether s ends with sentence-final punctuation
+// (.；？！ etc., optionally followed by a closing quote/bracket) — a preferred
+// bubble cut point (2026-10-20 20:18 口径「句子边界优先」).
+func endsWithSentencePunct(s string) bool {
+	t := strings.TrimRight(s, " \t\"'”’）)】》")
+	if t == "" {
+		return false
+	}
+	switch r, _ := utf8.DecodeLastRuneInString(t); r {
+	case '。', '！', '？', '；', '.', '!', '?', ';':
+		return true
+	}
+	return false
+}
+
+// splitBodyBubbles cuts the body part (below the divider) into semantic
+// bubbles: one topic / one Q&A / one paragraph per bubble (2026-10-20 20:17
+// 高律师令「应该按内容切一个一个气泡」).
 // Level-1 boundary is a blank line (\n\s*\n); a standalone "@@@" line forces a
-// break for manual control from the hub. Paragraphs are NEVER merged back
 // together. Code fences (``` blocks) and markdown tables (consecutive lines
 // starting with |) are kept intact. Empty segments are dropped; segments
 // shorter than 2 runes are merged into a neighbour. Only a segment longer than
 // maxWeixinChunk falls back to a hard splitUTF8 cut, with continuation chunks
 // prefixed by contMark.
-func splitBubbles(content string) []string {
+func splitBodyBubbles(content string) []string {
 	lines := strings.Split(content, "\n")
 	isTableLine := func(s string) bool { return strings.HasPrefix(strings.TrimSpace(s), "|") }
 	var segs []string
