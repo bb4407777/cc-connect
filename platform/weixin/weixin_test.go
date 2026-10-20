@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -101,6 +102,68 @@ func TestSplitUTF8Empty(t *testing.T) {
 	parts := splitUTF8("", maxWeixinChunk)
 	if len(parts) != 1 || parts[0] != "" {
 		t.Fatalf("parts=%#v", parts)
+	}
+}
+
+// 2026-10-20 20:17 高律师令「应该按内容切一个一个气泡」——以下 5 组覆盖语义切泡。
+
+func TestSplitBubbles_BlankLineSeparates(t *testing.T) {
+	got := splitBubbles("Q：案件进展如何\n\nA：已立案，等开庭。")
+	if len(got) != 2 || got[0] != "Q：案件进展如何" || got[1] != "A：已立案，等开庭。" {
+		t.Fatalf("parts=%#v, want 2 bubbles", got)
+	}
+}
+
+func TestSplitBubbles_ExplicitSeparator(t *testing.T) {
+	got := splitBubbles("第一条事项\n@@@\n第二条事项")
+	if len(got) != 2 || got[0] != "第一条事项" || got[1] != "第二条事项" {
+		t.Fatalf("parts=%#v, want @@@ to force a bubble break", got)
+	}
+}
+
+func TestSplitBubbles_CodeFenceIntact(t *testing.T) {
+	in := "前文\n\n```go\nx := 1\n\n@@@\ny := 2\n```\n\n后文"
+	got := splitBubbles(in)
+	if len(got) != 3 || got[0] != "前文" || got[2] != "后文" {
+		t.Fatalf("parts=%#v", got)
+	}
+	wantFence := "```go\nx := 1\n\n@@@\ny := 2\n```"
+	if got[1] != wantFence {
+		t.Fatalf("fence split: got %q, want %q", got[1], wantFence)
+	}
+}
+
+func TestSplitBubbles_TableIntact(t *testing.T) {
+	in := "说明\n\n| 事项 | 状态 |\n|---|---|\n\n| 立案 | 已提交 |\n\n结语"
+	got := splitBubbles(in)
+	if len(got) != 3 || got[0] != "说明" || got[2] != "结语" {
+		t.Fatalf("parts=%#v", got)
+	}
+	wantTable := "| 事项 | 状态 |\n|---|---|\n\n| 立案 | 已提交 |"
+	if got[1] != wantTable {
+		t.Fatalf("table split: got %q, want %q", got[1], wantTable)
+	}
+}
+
+func TestSplitBubbles_OverlongHardFallback(t *testing.T) {
+	got := splitBubbles(strings.Repeat("字", 4000))
+	if len(got) != 2 {
+		t.Fatalf("parts=%d, want 2 (hard fallback)", len(got))
+	}
+	if !strings.HasPrefix(got[1], contMark) {
+		t.Fatalf("continuation chunk missing prefix: %q", got[1][:20])
+	}
+	for i, p := range got {
+		if n := utf8.RuneCountInString(p); n > maxWeixinChunk {
+			t.Fatalf("chunk %d has %d runes > %d", i, n, maxWeixinChunk)
+		}
+	}
+}
+
+func TestSplitBubbles_ShortSegmentMergedAndEmptyDropped(t *testing.T) {
+	got := splitBubbles("正文足够长\n\n-\n\n\n\n尾巴内容")
+	if len(got) != 2 || got[0] != "正文足够长\n\n-" || got[1] != "尾巴内容" {
+		t.Fatalf("parts=%#v, want short segment merged into previous", got)
 	}
 }
 

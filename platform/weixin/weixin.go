@@ -890,7 +890,7 @@ func (p *Platform) sendChunks(ctx context.Context, replyCtx any, content string,
 	if strings.TrimSpace(content) == "" {
 		return nil
 	}
-	chunks := splitUTF8(content, maxWeixinChunk)
+	chunks := splitBubbles(content)
 	total := len(chunks)
 	for i, chunk := range chunks {
 		// Add delay between chunks to avoid rate limiting (except for first chunk)
@@ -969,6 +969,97 @@ func splitUTF8(s string, maxRunes int) []string {
 		runes = runes[n:]
 	}
 	return out
+}
+
+// contMark prefixes continuation chunks produced by the overlong-segment
+// fallback split (2026-10-14 高律师令「超长在句子边界自动拆条、第二条起标（续上条）」).
+const contMark = "（续上条）"
+
+// splitBubbles cuts content into semantic bubbles: one topic / one Q&A / one
+// paragraph per bubble (2026-10-20 20:17 高律师令「应该按内容切一个一个气泡」).
+// Level-1 boundary is a blank line (\n\s*\n); a standalone "@@@" line forces a
+// break for manual control from the hub. Paragraphs are NEVER merged back
+// together. Code fences (``` blocks) and markdown tables (consecutive lines
+// starting with |) are kept intact. Empty segments are dropped; segments
+// shorter than 2 runes are merged into a neighbour. Only a segment longer than
+// maxWeixinChunk falls back to a hard splitUTF8 cut, with continuation chunks
+// prefixed by contMark.
+func splitBubbles(content string) []string {
+	lines := strings.Split(content, "\n")
+	isTableLine := func(s string) bool { return strings.HasPrefix(strings.TrimSpace(s), "|") }
+	var segs []string
+	var cur []string
+	inFence := false
+	prevTable := false
+	flush := func() {
+		if s := strings.TrimSpace(strings.Join(cur, "\n")); s != "" {
+			segs = append(segs, s)
+		}
+		cur = nil
+	}
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		if inFence {
+			cur = append(cur, line)
+			if strings.HasPrefix(t, "```") {
+				inFence = false
+			}
+			continue
+		}
+		if strings.HasPrefix(t, "```") {
+			inFence = true
+			cur = append(cur, line)
+			continue
+		}
+		if t == "@@@" { // 独立一行 @@@：强制分泡
+			flush()
+			prevTable = false
+			continue
+		}
+		if t == "" { // 连续空行＝一级边界
+			// 表格块内的空行不拆（| 行夹着的空行仍属同一整块）
+			if prevTable && i+1 < len(lines) && isTableLine(lines[i+1]) {
+				cur = append(cur, line)
+				continue
+			}
+			flush()
+			prevTable = false
+			continue
+		}
+		cur = append(cur, line)
+		prevTable = isTableLine(line)
+	}
+	flush()
+
+	// 空段已丢弃；单段过短（<2 字）并入相邻（有前段并前段，否则并后段）
+	var merged []string
+	for _, s := range segs {
+		if utf8.RuneCountInString(s) < 2 && len(merged) > 0 {
+			merged[len(merged)-1] += "\n\n" + s
+			continue
+		}
+		merged = append(merged, s)
+	}
+	if len(merged) > 1 && utf8.RuneCountInString(merged[0]) < 2 {
+		merged[1] = merged[0] + "\n\n" + merged[1]
+		merged = merged[1:]
+	}
+
+	// 不合并；仅单段超长才回落 splitUTF8 硬切，续条加「（续上条）」
+	var chunks []string
+	for _, s := range merged {
+		if utf8.RuneCountInString(s) <= maxWeixinChunk {
+			chunks = append(chunks, s)
+			continue
+		}
+		for j, part := range splitUTF8(s, maxWeixinChunk-len(contMark)) {
+			if j > 0 {
+				part = contMark + part
+			}
+			chunks = append(chunks, part)
+		}
+	}
+	return chunks
 }
 
 // ReconstructReplyCtx implements core.ReplyContextReconstructor for cron / proactive sends.
