@@ -66,3 +66,25 @@ func TestProcessInteractiveEvents_NoHookRejectionKeepsTextAcrossToolBoundary(t *
 		t.Fatalf("final reply = %#v, want paragraph break across hidden tool boundary %q", got, "AAA\n\nBBB")
 	}
 }
+
+// 2026-10-20 20:17 高律师令「应该按内容切一个一个气泡」——joinTextParts 保证
+// 跨工具边界段间带空行（供 weixin splitBubbles 按空行分泡），且边界已有换行/空行时不重复补。
+func TestJoinTextParts_InsertsBlankLineAtBoundary(t *testing.T) {
+	if got := joinTextParts([]string{"AAA", "BBB"}); got != "AAA\n\nBBB" {
+		t.Fatalf("got %q, want AAA\\n\\nBBB", got)
+	}
+}
+
+func TestJoinTextParts_NoDuplicateBlankLineAtBoundary(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{joinTextParts([]string{"AAA\n", "BBB"}), "AAA\nBBB"},
+		{joinTextParts([]string{"AAA\n\n", "BBB"}), "AAA\n\nBBB"},
+		{joinTextParts([]string{"AAA", "\nBBB"}), "AAA\nBBB"},
+		{joinTextParts([]string{"AAA\n\n", " BBB"}), "AAA\n\n BBB"},
+	}
+	for i, c := range cases {
+		if c.in != c.want {
+			t.Fatalf("case %d: got %q, want %q", i, c.in, c.want)
+		}
+	}
+}
