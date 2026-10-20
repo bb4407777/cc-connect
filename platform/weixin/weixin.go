@@ -4,11 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
-	"net"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -975,43 +975,52 @@ func splitUTF8(s string, maxRunes int) []string {
 // fallback split (2026-10-14 高律师令「超长在句子边界自动拆条、第二条起标（续上条）」).
 const contMark = "（续上条）"
 
-// Broadcast-bubble targets (2026-10-20 20:18 高律师令「这个播报可以每隔 50~100 字
-// 左右，做个消息气泡」): accumulate digest lines, cut once a bubble reaches 50
-// runes, keep every bubble under 100.
-const (
-	bubbleBroadcastMin = 50
-	bubbleBroadcastMax = 100
-)
-
 // splitBubbles cuts a reply into Weixin message bubbles, sent back-to-back.
 //
-// A standalone divider line (3+ em dashes, e.g. —————) splits the reply into
-// the broadcast block (【后台待报】 digest, above the divider) and the body
-// (below), per 2026-10-20 20:18 高律师令「现在不是有个分割线吗？分割线上方是后台
-// 做完的播报。这个播报可以每隔 50~100 字左右，做个消息气泡，然后直接一次性回复
-// 过来。」:
-//   - broadcast: digest lines are aggregated into 50~100-rune bubbles
-//     (splitBroadcastBubbles);
-//   - the divider line itself is emitted as its own bubble so the 分割线
-//     stays visible between the two parts;
-//   - body falls through to splitBodyBubbles (blank-line / @@@ / fence / table
-//     semantics, 2026-10-20 20:17 高律师令「应该按内容切一个一个气泡」).
+// 2026-10-20 21:24 高律师令「现在消息分气泡分错了，是播报和即时回复之间分气泡，
+// 不是消息内部分气泡」：只在「播报」与「即时回复」之间分泡，一次回复最多两泡——
+// 播报（【后台待报】整块，含其中的分割线）一泡、即时回复（Q/A 正文）一泡；
+// 泡内不再按空行/@@@/句号/字数二次切分，原样保留。
 //
-// Content without a divider goes straight to splitBodyBubbles. checkSendQuota
-// stays per-call in sendChunks: multiple bubbles are one logical message.
+// 泡内不合并、不按空行/@@@/围栏/句读再切，只 trim 首尾空白。
+// 单泡超 maxWeixinChunk 才回落 splitUTF8 硬切、续条标 contMark（防平台拒收），
+// 这是唯一会在一泡内产生多条的例外。
+//
+// checkSendQuota stays per-call in sendChunks: multiple bubbles are one logical message.
 func splitBubbles(content string) []string {
+	parts := splitBroadcastAndBody(content)
+	var out []string
+	for _, p := range parts {
+		out = append(out, hardSplitOverlong(p)...)
+	}
+	return out
+}
+
+// splitBroadcastAndBody splits a reply at the first standalone divider line
+// (3+ em dashes, e.g. —————). Everything above the divider — the 【后台待报】
+// digest and the divider itself — is bubble #1 with its original internal
+// layout kept; everything below — the immediate Q/A reply — is bubble #2.
+// Content without a divider is a single bubble.
+func splitBroadcastAndBody(content string) []string {
 	lines := strings.Split(content, "\n")
 	for i, line := range lines {
 		if !isBubbleDivider(line) {
 			continue
 		}
+		broadcast := strings.TrimSpace(strings.Join(lines[:i+1], "\n"))
+		body := strings.TrimSpace(strings.Join(lines[i+1:], "\n"))
 		var out []string
-		out = append(out, splitBroadcastBubbles(lines[:i])...)
-		out = append(out, strings.TrimSpace(line))
-		out = append(out, splitBodyBubbles(strings.Join(lines[i+1:], "\n"))...)
+		for _, p := range []string{broadcast, body} {
+			if p != "" {
+				out = append(out, p)
+			}
+		}
 		return out
 	}
-	return splitBodyBubbles(content)
+	if s := strings.TrimSpace(content); s != "" {
+		return []string{s}
+	}
+	return nil
 }
 
 // isBubbleDivider reports whether line is a standalone divider: only em dashes,
@@ -1029,148 +1038,20 @@ func isBubbleDivider(line string) bool {
 	return true
 }
 
-// splitBroadcastBubbles aggregates broadcast digest lines (one item per line)
-// into bubbles of ~50-100 runes: accumulate line by line, flush once the
-// bubble reaches bubbleBroadcastMin — preferring a cut right after sentence
-// punctuation (。；？！), deferring up to bubbleBroadcastMax when the current
-// tail has none; adding a line that would push past bubbleBroadcastMax flushes
-// first, and a single line over bubbleBroadcastMax stands alone as one bubble
-// and is never merged with neighbours.
-func splitBroadcastBubbles(lines []string) []string {
-	var out []string
-	var cur []string
-	curLen := 0
-	flush := func() {
-		if len(cur) > 0 {
-			out = append(out, strings.Join(cur, "\n"))
-			cur = nil
-			curLen = 0
-		}
+// hardSplitOverlong is the last-resort fallback for a single bubble longer than
+// maxWeixinChunk: hard split at maxWeixinChunk runes and prefix continuation
+// chunks with contMark (2026-10-14 高律师令「超长在句子边界自动拆条、第二条起标（续上条）」).
+// It never splits a bubble that fits.
+func hardSplitOverlong(s string) []string {
+	if utf8.RuneCountInString(s) <= maxWeixinChunk {
+		return []string{s}
 	}
-	for _, line := range lines {
-		line = strings.TrimRight(line, " \t")
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		if n := utf8.RuneCountInString(line); n > bubbleBroadcastMax {
-			flush() // 单条超 100 字：整行单独成泡，不与相邻行合并
-			out = append(out, line)
-			continue
-		}
-		if curLen > 0 && curLen+1+utf8.RuneCountInString(line) > bubbleBroadcastMax {
-			flush() // 再并一行会破 100 上限：先断
-		}
-		cur = append(cur, line)
-		curLen += utf8.RuneCountInString(line)
-		if len(cur) > 1 {
-			curLen++ // joiner newline
-		}
-		if curLen >= bubbleBroadcastMin && (endsWithSentencePunct(line) || curLen >= bubbleBroadcastMax) {
-			flush() // 满 50 即断；断点优先句末标点，无标点则顶到 100 上限
-		}
-	}
-	flush()
-	return out
-}
-
-// endsWithSentencePunct reports whether s ends with sentence-final punctuation
-// (.；？！ etc., optionally followed by a closing quote/bracket) — a preferred
-// bubble cut point (2026-10-20 20:18 口径「句子边界优先」).
-func endsWithSentencePunct(s string) bool {
-	t := strings.TrimRight(s, " \t\"'”’）)】》")
-	if t == "" {
-		return false
-	}
-	switch r, _ := utf8.DecodeLastRuneInString(t); r {
-	case '。', '！', '？', '；', '.', '!', '?', ';':
-		return true
-	}
-	return false
-}
-
-// splitBodyBubbles cuts the body part (below the divider) into semantic
-// bubbles: one topic / one Q&A / one paragraph per bubble (2026-10-20 20:17
-// 高律师令「应该按内容切一个一个气泡」).
-// Level-1 boundary is a blank line (\n\s*\n); a standalone "@@@" line forces a
-// together. Code fences (``` blocks) and markdown tables (consecutive lines
-// starting with |) are kept intact. Empty segments are dropped; segments
-// shorter than 2 runes are merged into a neighbour. Only a segment longer than
-// maxWeixinChunk falls back to a hard splitUTF8 cut, with continuation chunks
-// prefixed by contMark.
-func splitBodyBubbles(content string) []string {
-	lines := strings.Split(content, "\n")
-	isTableLine := func(s string) bool { return strings.HasPrefix(strings.TrimSpace(s), "|") }
-	var segs []string
-	var cur []string
-	inFence := false
-	prevTable := false
-	flush := func() {
-		if s := strings.TrimSpace(strings.Join(cur, "\n")); s != "" {
-			segs = append(segs, s)
-		}
-		cur = nil
-	}
-	for i, line := range lines {
-		t := strings.TrimSpace(line)
-		if inFence {
-			cur = append(cur, line)
-			if strings.HasPrefix(t, "```") {
-				inFence = false
-			}
-			continue
-		}
-		if strings.HasPrefix(t, "```") {
-			inFence = true
-			cur = append(cur, line)
-			continue
-		}
-		if t == "@@@" { // 独立一行 @@@：强制分泡
-			flush()
-			prevTable = false
-			continue
-		}
-		if t == "" { // 连续空行＝一级边界
-			// 表格块内的空行不拆（| 行夹着的空行仍属同一整块）
-			if prevTable && i+1 < len(lines) && isTableLine(lines[i+1]) {
-				cur = append(cur, line)
-				continue
-			}
-			flush()
-			prevTable = false
-			continue
-		}
-		cur = append(cur, line)
-		prevTable = isTableLine(line)
-	}
-	flush()
-
-	// 空段已丢弃；单段过短（<2 字）并入相邻（有前段并前段，否则并后段）
-	var merged []string
-	for _, s := range segs {
-		if utf8.RuneCountInString(s) < 2 && len(merged) > 0 {
-			merged[len(merged)-1] += "\n\n" + s
-			continue
-		}
-		merged = append(merged, s)
-	}
-	if len(merged) > 1 && utf8.RuneCountInString(merged[0]) < 2 {
-		merged[1] = merged[0] + "\n\n" + merged[1]
-		merged = merged[1:]
-	}
-
-	// 不合并；仅单段超长才回落 splitUTF8 硬切，续条加「（续上条）」
 	var chunks []string
-	for _, s := range merged {
-		if utf8.RuneCountInString(s) <= maxWeixinChunk {
-			chunks = append(chunks, s)
-			continue
+	for j, part := range splitUTF8(s, maxWeixinChunk-len(contMark)) {
+		if j > 0 {
+			part = contMark + part
 		}
-		for j, part := range splitUTF8(s, maxWeixinChunk-len(contMark)) {
-			if j > 0 {
-				part = contMark + part
-			}
-			chunks = append(chunks, part)
-		}
+		chunks = append(chunks, part)
 	}
 	return chunks
 }

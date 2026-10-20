@@ -105,65 +105,83 @@ func TestSplitUTF8Empty(t *testing.T) {
 	}
 }
 
-// 2026-10-20 20:17 高律师令「应该按内容切一个一个气泡」——以下 5 组覆盖语义切泡。
+// 2026-10-20 21:24 高律师令「现在消息分气泡分错了，是播报和即时回复之间分气泡，
+// 不是消息内部分气泡」——以下覆盖两泡模型：播报一泡（含分割线）、正文一泡；
+// 泡内不按空行/@@@/围栏/表格/句号/字数二次切分；仅单泡超长回落硬切。
 
-func TestSplitBubbles_BlankLineSeparates(t *testing.T) {
-	got := splitBubbles("Q：案件进展如何\n\nA：已立案，等开庭。")
-	if len(got) != 2 || got[0] != "Q：案件进展如何" || got[1] != "A：已立案，等开庭。" {
-		t.Fatalf("parts=%#v, want 2 bubbles", got)
-	}
-}
-
-func TestSplitBubbles_ExplicitSeparator(t *testing.T) {
-	got := splitBubbles("第一条事项\n@@@\n第二条事项")
-	if len(got) != 2 || got[0] != "第一条事项" || got[1] != "第二条事项" {
-		t.Fatalf("parts=%#v, want @@@ to force a bubble break", got)
-	}
-}
-
-func TestSplitBubbles_CodeFenceIntact(t *testing.T) {
-	in := "前文\n\n```go\nx := 1\n\n@@@\ny := 2\n```\n\n后文"
+func TestSplitBubbles_DividerSplitsBroadcastFromBody(t *testing.T) {
+	in := "【后台待报】\n- 案件一：已立案\n- 案件二：等开庭\n\n—————\n\nQ：进展如何\n\nA：都推完了。"
 	got := splitBubbles(in)
-	if len(got) != 3 || got[0] != "前文" || got[2] != "后文" {
-		t.Fatalf("parts=%#v", got)
-	}
-	wantFence := "```go\nx := 1\n\n@@@\ny := 2\n```"
-	if got[1] != wantFence {
-		t.Fatalf("fence split: got %q, want %q", got[1], wantFence)
-	}
-}
-
-func TestSplitBubbles_TableIntact(t *testing.T) {
-	in := "说明\n\n| 事项 | 状态 |\n|---|---|\n\n| 立案 | 已提交 |\n\n结语"
-	got := splitBubbles(in)
-	if len(got) != 3 || got[0] != "说明" || got[2] != "结语" {
-		t.Fatalf("parts=%#v", got)
-	}
-	wantTable := "| 事项 | 状态 |\n|---|---|\n\n| 立案 | 已提交 |"
-	if got[1] != wantTable {
-		t.Fatalf("table split: got %q, want %q", got[1], wantTable)
-	}
-}
-
-func TestSplitBubbles_OverlongHardFallback(t *testing.T) {
-	got := splitBubbles(strings.Repeat("字", 4000))
 	if len(got) != 2 {
-		t.Fatalf("parts=%d, want 2 (hard fallback)", len(got))
+		t.Fatalf("parts=%#v, want exactly 2 bubbles", got)
 	}
-	if !strings.HasPrefix(got[1], contMark) {
-		t.Fatalf("continuation chunk missing prefix: %q", got[1][:20])
+	if want := "【后台待报】\n- 案件一：已立案\n- 案件二：等开庭\n\n—————"; got[0] != want {
+		t.Fatalf("broadcast=%q, want %q", got[0], want)
+	}
+	if want := "Q：进展如何\n\nA：都推完了。"; got[1] != want {
+		t.Fatalf("body=%q, want %q (no inner split)", got[1], want)
+	}
+}
+
+func TestSplitBubbles_BodyNotSplitAtBlankLineOrMarker(t *testing.T) {
+	in := "播报一条。\n—————\nQ：问题\n\nA：回答。\n@@@\n第二条\n\n```go\nx := 1\n```\n\n| 一 | 二 |\n|---|---|\n尾"
+	got := splitBubbles(in)
+	if len(got) != 2 {
+		t.Fatalf("parts=%#v, want 2 bubbles (body intact)", got)
+	}
+	if got[0] != "播报一条。\n—————" {
+		t.Fatalf("broadcast=%q", got[0])
+	}
+	if !strings.Contains(got[1], "@@@") || !strings.HasSuffix(got[1], "尾") {
+		t.Fatalf("body must stay in one bubble: %q", got[1])
+	}
+}
+
+func TestSplitBubbles_WithoutDividerIsSingleBubble(t *testing.T) {
+	in := "Q：问题\n\nA：回答。\n\n另一段。"
+	got := splitBubbles(in)
+	if len(got) != 1 || got[0] != in {
+		t.Fatalf("parts=%#v, want one untouched bubble", got)
+	}
+}
+
+func TestSplitBubbles_OverlongSingleBubbleHardFallback(t *testing.T) {
+	got := splitBubbles("播报。\n—————\n" + strings.Repeat("字", 4000))
+	if len(got) != 3 {
+		t.Fatalf("parts=%d, want 3 (broadcast + 2 hard chunks)", len(got))
+	}
+	if got[0] != "播报。\n—————" {
+		t.Fatalf("broadcast=%q", got[0])
 	}
 	for i, p := range got {
 		if n := utf8.RuneCountInString(p); n > maxWeixinChunk {
 			t.Fatalf("chunk %d has %d runes > %d", i, n, maxWeixinChunk)
 		}
 	}
+	if !strings.HasPrefix(got[2], contMark) {
+		t.Fatalf("continuation chunk missing prefix: %q", got[2][:20])
+	}
 }
 
-func TestSplitBubbles_ShortSegmentMergedAndEmptyDropped(t *testing.T) {
-	got := splitBubbles("正文足够长\n\n-\n\n\n\n尾巴内容")
-	if len(got) != 2 || got[0] != "正文足够长\n\n-" || got[1] != "尾巴内容" {
-		t.Fatalf("parts=%#v, want short segment merged into previous", got)
+func TestSplitBubbles_EmptyDividerTail(t *testing.T) {
+	got := splitBubbles("播报。（续）\n—————\n")
+	if len(got) != 1 || got[0] != "播报。（续）\n—————" {
+		t.Fatalf("parts=%#v, want broadcast only", got)
+	}
+}
+
+func TestIsBubbleDivider(t *testing.T) {
+	yes := []string{"—————", "———", " ——— ", "——————————"}
+	no := []string{"——", "—— 分割 ——", "-——-", "正文", "", "---"}
+	for _, s := range yes {
+		if !isBubbleDivider(s) {
+			t.Fatalf("isBubbleDivider(%q)=false, want true", s)
+		}
+	}
+	for _, s := range no {
+		if isBubbleDivider(s) {
+			t.Fatalf("isBubbleDivider(%q)=true, want false", s)
+		}
 	}
 }
 
