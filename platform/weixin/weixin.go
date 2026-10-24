@@ -996,31 +996,42 @@ func splitBubbles(content string) []string {
 	return out
 }
 
-// splitBroadcastAndBody splits a reply at the first standalone divider line
-// (3+ em dashes, e.g. —————). Everything above the divider — the 【后台待报】
-// digest and the divider itself — is bubble #1 with its original internal
-// layout kept; everything below — the immediate Q/A reply — is bubble #2.
-// Content without a divider is a single bubble.
+// splitBroadcastAndBody splits a reply at every standalone divider line
+// (3+ em dashes, e.g. —————). Each divider stays attached to the block above
+// it, so one digest entry plus its divider forms one bubble and the text after
+// the last divider forms the final bubble. Content without a divider is a
+// single bubble.
+//
+// 2026-10-24 高律师「第二第三个摘要挤在一个气泡」：旧实现只在第一条分割线处切一次，
+// 播报/待办两条时正确，但摘要一次取多条时，第 2 条往后全落进同一泡。改为逐条切。
 func splitBroadcastAndBody(content string) []string {
 	lines := strings.Split(content, "\n")
+	var out []string
+	start := 0
 	for i, line := range lines {
 		if !isBubbleDivider(line) {
 			continue
 		}
-		broadcast := strings.TrimSpace(strings.Join(lines[:i+1], "\n"))
-		body := strings.TrimSpace(strings.Join(lines[i+1:], "\n"))
-		var out []string
-		for _, p := range []string{broadcast, body} {
-			if p != "" {
-				out = append(out, p)
-			}
+		if p := strings.TrimSpace(strings.Join(lines[start:i+1], "\n")); p != "" && !onlyDividers(p) {
+			out = append(out, p)
 		}
-		return out
+		start = i + 1
 	}
-	if s := strings.TrimSpace(content); s != "" {
-		return []string{s}
+	if p := strings.TrimSpace(strings.Join(lines[start:], "\n")); p != "" {
+		out = append(out, p)
 	}
-	return nil
+	return out
+}
+
+// onlyDividers reports whether a block holds nothing but divider lines (and
+// blanks), i.e. a repeated separator that must not become an empty bubble.
+func onlyDividers(block string) bool {
+	for _, line := range strings.Split(block, "\n") {
+		if strings.TrimSpace(line) != "" && !isBubbleDivider(line) {
+			return false
+		}
+	}
+	return true
 }
 
 // isBubbleDivider reports whether line is a standalone divider: only em dashes,

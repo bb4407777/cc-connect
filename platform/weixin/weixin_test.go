@@ -123,6 +123,36 @@ func TestSplitBubbles_DividerSplitsBroadcastFromBody(t *testing.T) {
 	}
 }
 
+// 2026-10-24 高律师「第二第三个摘要挤在一个气泡里面了」：一次取多条摘要时，
+// 每条自带分割线，必须逐条成泡，不能只在第一条处切。
+func TestSplitBubbles_EachDigestEntryOwnBubble(t *testing.T) {
+	in := "【摘要】今日第 1 条\nQ：一\n\nA：甲\n\n—————\n\n" +
+		"【摘要】今日第 2 条\nQ：二\n\nA：乙\n\n—————\n\n" +
+		"【摘要】今日第 3 条\nQ：三\n\nA：丙"
+	got := splitBubbles(in)
+	if len(got) != 3 {
+		t.Fatalf("parts=%d %#v, want 3 bubbles (one per digest)", len(got), got)
+	}
+	if !strings.HasPrefix(got[1], "【摘要】今日第 2 条") || !strings.HasSuffix(got[1], "—————") {
+		t.Fatalf("bubble #2=%q", got[1])
+	}
+	if got[2] != "【摘要】今日第 3 条\nQ：三\n\nA：丙" {
+		t.Fatalf("bubble #3=%q", got[2])
+	}
+	for _, p := range got {
+		if strings.Count(p, "【摘要】") != 1 {
+			t.Fatalf("bubble carries more than one digest: %q", p)
+		}
+	}
+}
+
+func TestSplitBubbles_ConsecutiveDividersNoEmptyBubble(t *testing.T) {
+	got := splitBubbles("一\n—————\n\n—————\n二")
+	if len(got) != 2 {
+		t.Fatalf("parts=%#v, want 2 (empty block dropped)", got)
+	}
+}
+
 func TestSplitBubbles_BodyNotSplitAtBlankLineOrMarker(t *testing.T) {
 	in := "播报一条。\n—————\nQ：问题\n\nA：回答。\n@@@\n第二条\n\n```go\nx := 1\n```\n\n| 一 | 二 |\n|---|---|\n尾"
 	got := splitBubbles(in)
