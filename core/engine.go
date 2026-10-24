@@ -16759,8 +16759,22 @@ func (e *Engine) buildSenderPrompt(content, userID, userName, platform, sessionK
 	if userMessageTimeMs > 0 {
 		prefix = time.UnixMilli(userMessageTimeMs).Local().Format("[Mon 2006-01-02 15:04:05 MST] ")
 	}
+	// prompt.build injectors (2026-10-24): context gathered from local stores is
+	// spliced in ahead of the user's own words, so a bad injector degrades into
+	// "no context" instead of a dropped message.
+	brief := ""
+	if inj := e.hooks.Injections(HookEvent{
+		Event:      HookEventPromptBuild,
+		SessionKey: sessionKey,
+		Platform:   platform,
+		UserID:     userID,
+		UserName:   userName,
+		Content:    content,
+	}); len(inj) > 0 {
+		brief = strings.Join(inj, "\n\n") + "\n\n"
+	}
 	if !e.injectSender || userID == "" {
-		return prefix + content
+		return prefix + brief + content
 	}
 	chatID := channelKey
 	if chatID == "" {
@@ -16768,9 +16782,9 @@ func (e *Engine) buildSenderPrompt(content, userID, userName, platform, sessionK
 	}
 	if userName != "" {
 		safeName := strings.NewReplacer(`"`, `'`, "\n", " ", "\r", "").Replace(userName)
-		return fmt.Sprintf("%s[cc-connect sender_id=%s sender_name=\"%s\" platform=%s chat_id=%s]\n%s", prefix, userID, safeName, platform, chatID, content)
+		return fmt.Sprintf("%s[cc-connect sender_id=%s sender_name=\"%s\" platform=%s chat_id=%s]\n%s%s", prefix, userID, safeName, platform, chatID, brief, content)
 	}
-	return fmt.Sprintf("%s[cc-connect sender_id=%s platform=%s chat_id=%s]\n%s", prefix, userID, platform, chatID, content)
+	return fmt.Sprintf("%s[cc-connect sender_id=%s platform=%s chat_id=%s]\n%s%s", prefix, userID, platform, chatID, brief, content)
 }
 
 func extractChannelID(sessionKey string) string {

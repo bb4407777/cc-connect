@@ -174,6 +174,7 @@ type HookConfig struct {
 	URL     string `toml:"url,omitempty"`     // HTTP endpoint (type=http)
 	Timeout int    `toml:"timeout,omitempty"` // seconds; 0 = default
 	Async   *bool  `toml:"async,omitempty"`   // nil = true (async by default)
+	Inject  *bool  `toml:"inject,omitempty"`  // nil = false; sync hook whose stdout is prepended to the prompt (event=prompt.build)
 }
 
 // ManagementConfig controls the HTTP Management API for external tools.

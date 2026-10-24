@@ -580,6 +580,7 @@ func main() {
 					URL:     h.URL,
 					Timeout: h.Timeout,
 					Async:   h.Async,
+					Inject:  h.Inject,
 				}
 			}
 			engine.SetHooks(core.NewHookManager(proj.Name, coreHooks, shell, shellFlag, shellProfile))

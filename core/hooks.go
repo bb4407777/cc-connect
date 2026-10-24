@@ -19,6 +19,7 @@ type HookEventType string
 const (
 	HookEventMessageReceived    HookEventType = "message.received"
 	HookEventMessageSent        HookEventType = "message.sent"
+	HookEventPromptBuild        HookEventType = "prompt.build"
 	HookEventSessionStarted     HookEventType = "session.started"
 	HookEventSessionEnded       HookEventType = "session.ended"
 	HookEventCronTriggered      HookEventType = "cron.triggered"
@@ -43,6 +44,11 @@ type HookConfig struct {
 	URL     string `toml:"url" json:"url,omitempty"`
 	Timeout int    `toml:"timeout" json:"timeout,omitempty"` // seconds; 0 = default (10s cmd, 5s http)
 	Async   *bool  `toml:"async" json:"async,omitempty"`     // nil = true (async by default)
+	// Inject marks a synchronous command hook whose stdout is prepended to the
+	// prompt (event=prompt.build). Injectors run inline on the message path, so
+	// they must stay fast; a failure or timeout is logged and skipped, never
+	// blocking the turn.
+	Inject *bool `toml:"inject" json:"inject,omitempty"` // nil = false
 }
 
 func (h *HookConfig) isAsync() bool {
@@ -123,6 +129,9 @@ func validateHookConfig(h HookConfig) error {
 	default:
 		return fmt.Errorf("unknown handler type %q (must be command or http)", h.Type)
 	}
+	if h.Inject != nil && *h.Inject && HookHandlerType(h.Type) != HookHandlerCommand {
+		return fmt.Errorf("inject requires type=command")
+	}
 	return nil
 }
 
@@ -151,6 +160,62 @@ func (hm *HookManager) Emit(event HookEvent) {
 			hm.execute(h, event)
 		}
 	}
+}
+
+// Injections runs every hook marked inject=true whose event matches, in
+// config order, and returns their combined stdout. Unlike Emit these run
+// synchronously on the caller's goroutine, because the caller needs the text
+// before building the prompt. A failing or timing-out injector is logged and
+// skipped: injecting context must never cost the user their message.
+func (hm *HookManager) Injections(event HookEvent) []string {
+	if hm == nil {
+		return nil
+	}
+	event.Project = hm.project
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now()
+	}
+
+	hm.mu.RLock()
+	hooks := hm.hooks
+	hm.mu.RUnlock()
+
+	var out []string
+	for i := range hooks {
+		h := &hooks[i]
+		if h.Inject == nil || !*h.Inject {
+			continue
+		}
+		if !matchEvent(h.Event, string(event.Event)) {
+			continue
+		}
+		text, err := hm.runInjector(h, event)
+		if err != nil {
+			slog.Warn("hooks: injector failed, prompt sent without it",
+				"project", hm.project, "event", event.Event,
+				"command", truncateStr(h.Command, 80), "error", err)
+			continue
+		}
+		if text != "" {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func (hm *HookManager) runInjector(h *HookConfig, event HookEvent) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), h.timeoutDuration())
+	defer cancel()
+
+	cmd := shellExecCommand(ctx, hm.shell, hm.shellFlag, hm.shellProfile, h.Command)
+	cmd.WaitDelay = 2 * time.Second
+	cmd.Env = append(os.Environ(), eventToEnv(event)...)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
 }
 
 // matchEvent checks if a hook's event pattern matches the fired event.
