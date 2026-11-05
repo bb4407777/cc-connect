@@ -191,10 +191,10 @@ func TestSkills_WorkspaceResolutionIsolationAndDirectoryChanges(t *testing.T) {
 	// Directory overrides must affect card navigation as well as slash commands.
 	store := NewProjectStateStore(filepath.Join(t.TempDir(), "project.json"))
 	e.SetProjectStateStore(store)
-	store.SetWorkspaceDirOverride(a+":"+skillMessage(p.Name(), "a", "").SessionKey, b)
+	store.SetWorkspaceDirOverride(normalizeWorkspacePath(a)+":"+skillMessage(p.Name(), "a", "").SessionKey, b)
 	card := e.handleCardNav("nav:/skills", skillMessage(p.Name(), "a", "").SessionKey)
 	assertWorkspaceSkills(t, card.RenderText(), "b", "a")
-	store.ClearWorkspaceDirOverride(a + ":" + skillMessage(p.Name(), "a", "").SessionKey)
+	store.ClearWorkspaceDirOverride(normalizeWorkspacePath(a) + ":" + skillMessage(p.Name(), "a", "").SessionKey)
 	// The provider's current work_dir is consulted even in single-workspace mode.
 	e.multiWorkspace = false
 	agent := e.agent.(*workspaceSkillAgent)
@@ -301,7 +301,11 @@ func TestSkills_ScheduledJobsUseExecutionWorkspace(t *testing.T) {
 					t.Fatal(err)
 				}
 				text := strings.Join(plain.getSent(), "\n")
-				for _, want := range []string{"Executed in " + wantDir, wantBody, "scheduled"} {
+				if !strings.Contains(text, "Executed in "+wantDir) &&
+					!strings.Contains(text, "Executed in "+normalizeWorkspacePath(wantDir)) {
+					t.Errorf("missing execution workspace %q: %s", wantDir, text)
+				}
+				for _, want := range []string{wantBody, "scheduled"} {
 					if !strings.Contains(text, want) {
 						t.Errorf("missing %q: %s", want, text)
 					}

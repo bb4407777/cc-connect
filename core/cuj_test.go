@@ -57,7 +57,7 @@ func TestCUJ_A8_ImmediateReceiptsDuringStartupAndQueue(t *testing.T) {
 	// User action 2: submit a follow-up while the first task awaits its result.
 	env.send("second", "follow-up task", 2000)
 	env.assertReceipts("first", "second")
-	env.awaitVisible(env.engine.i18n.T(MsgMessageQueued))
+	// 排队回执已停发（custom 2026-10-24）：连发的后续消息不再回 📬，收尾统一断言一次。
 
 	// User action 3: check status; local commands do not claim an agent turn.
 	env.send("status", "/status", 3000)
@@ -70,6 +70,13 @@ func TestCUJ_A8_ImmediateReceiptsDuringStartupAndQueue(t *testing.T) {
 	env.startup.session.events <- Event{Type: EventResult, Content: "second answer", Done: true}
 	env.awaitVisible("second answer")
 	env.assertReceipts("first", "second")
+
+	// 全程不应出现排队回执。
+	for _, message := range env.plat.getSent() {
+		if strings.Contains(message, env.engine.i18n.T(MsgMessageQueued)) {
+			t.Fatalf("queued ack must not be sent, got %q", message)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2071,15 +2078,23 @@ func TestCUJ_H2_TwoPlatformsConcurrentNoBleed(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Wait for all turns to finish. Generous deadline so this stays green
-	// when the whole core package is run with `-race -parallel=N` on
-	// constrained CI hosts; the in-isolation run finishes < 2s.
+	// 连发合并（custom 2026-10-24）：同一会话连发的多条并入一个待处理项，
+	// 因此每个会话最终至少 1 条 user 记录即算全部落地；关键断言仍是不串台。
+	pending := func(key string) int {
+		e.interactiveMu.Lock()
+		defer e.interactiveMu.Unlock()
+		st := e.interactiveStates[key]
+		if st == nil {
+			return 0
+		}
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return len(st.pendingMessages)
+	}
 	deadline := time.After(30 * time.Second)
 	for {
 		histA := e.sessions.GetOrCreateActive("platA:userA").GetHistory(0)
 		histB := e.sessions.GetOrCreateActive("platB:userB").GetHistory(0)
-		// Each user sent 5 messages — expect each session to have ≥5 user
-		// entries when fully drained.
 		userA := 0
 		for _, h := range histA {
 			if h.Role == "user" {
@@ -2092,7 +2107,7 @@ func TestCUJ_H2_TwoPlatformsConcurrentNoBleed(t *testing.T) {
 				userB++
 			}
 		}
-		if userA >= 5 && userB >= 5 {
+		if userA >= 1 && userB >= 1 && pending("platA:userA") == 0 && pending("platB:userB") == 0 {
 			break
 		}
 		select {
@@ -2539,7 +2554,7 @@ func TestCUJ_H5_WorkspaceSkillDiscoveryAndInvocation(t *testing.T) {
 		env := &cujEnv{t: t, engine: e, plat: p}
 		env.waitFor("workspace skill response", 3*time.Second, func() bool {
 			for _, text := range p.getSent()[before:] {
-				if strings.Contains(text, "Executed in "+ws) && strings.Contains(text, "Instructions "+channel) {
+				if strings.Contains(text, "Executed in "+normalizeWorkspacePath(ws)) && strings.Contains(text, "Instructions "+channel) {
 					return true
 				}
 			}

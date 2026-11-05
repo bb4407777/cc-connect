@@ -146,6 +146,10 @@ type CronConfig struct {
 // QueueConfig controls the per-session message queue.
 type QueueConfig struct {
 	MaxDepth *int `toml:"max_depth"` // max queued messages per session; default 5
+	// BusyInputMode: how a message arriving mid-turn is handled.
+	// "queue" (default) merges it into one pending follow-up turn;
+	// "steer" injects it into the running turn instead.
+	BusyInputMode string `toml:"busy_input_mode"`
 }
 
 // WebhookConfig controls the external HTTP webhook endpoint.

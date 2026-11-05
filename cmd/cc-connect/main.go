@@ -703,6 +703,11 @@ func main() {
 			engine.SetMaxQueuedMessages(*cfg.Queue.MaxDepth)
 		}
 
+		// Wire busy input mode (queue | steer)
+		if cfg.Queue.BusyInputMode != "" {
+			engine.SetBusyInputMode(cfg.Queue.BusyInputMode)
+		}
+
 		// Wire auto-compress settings
 		if proj.AutoCompress.Enabled != nil && *proj.AutoCompress.Enabled {
 			minGap := 30 * time.Minute

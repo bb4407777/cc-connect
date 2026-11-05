@@ -285,7 +285,7 @@ func TestQueuedMessagePreservesFiles(t *testing.T) {
 	queued.Files = []core.FileAttachment{{MimeType: "text/plain", FileName: "queued.txt", Data: []byte("queued-file")}}
 	engine.ReceiveMessage(platform, queued)
 
-	platform.waitTextContaining(t, "process after")
+	// 排队回执已停发；直接释放首轮，验证附件随排队正文进入下一轮。
 	agent.session.releaseFirstResult("first done")
 
 	records := agent.session.waitRecords(t, 2)

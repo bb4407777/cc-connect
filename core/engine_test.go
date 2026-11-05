@@ -8979,7 +8979,7 @@ func TestReapIdleWorkspaces_SkipsWorkspaceWaitingForPermission(t *testing.T) {
 	}
 }
 
-func TestQueueMessageForBusySession_FIFODequeue(t *testing.T) {
+func TestQueueMessageForBusySession_BurstMerged(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	sess := newQueuingSession("qs1")
 	agent := &controllableAgent{nextSession: sess}
@@ -9016,14 +9016,17 @@ func TestQueueMessageForBusySession_FIFODequeue(t *testing.T) {
 	}
 	sess.sendMu.Unlock()
 
-	// Verify pending messages queue has correct FIFO order.
+	// 连发合并（custom 2026-10-24）：两条并成一条待处理项，正文按先后拼接，
+	// replyCtx 取最新一条。FIFO 由拼接顺序保证。
 	state.mu.Lock()
-	if len(state.pendingMessages) != 2 {
-		t.Fatalf("pendingMessages len = %d, want 2", len(state.pendingMessages))
+	if len(state.pendingMessages) != 1 {
+		t.Fatalf("pendingMessages len = %d, want 1 (burst merged)", len(state.pendingMessages))
 	}
-	if state.pendingMessages[0].content != "msg1" || state.pendingMessages[1].content != "msg2" {
-		t.Fatalf("pendingMessages = [%s, %s], want [msg1, msg2]",
-			state.pendingMessages[0].content, state.pendingMessages[1].content)
+	if state.pendingMessages[0].content != "msg1\n\nmsg2" {
+		t.Fatalf("pendingMessages content = %q, want msg1\\n\\nmsg2", state.pendingMessages[0].content)
+	}
+	if state.pendingMessages[0].replyCtx != "ctx-msg2" {
+		t.Fatalf("replyCtx = %v, want ctx-msg2", state.pendingMessages[0].replyCtx)
 	}
 	state.mu.Unlock()
 }
@@ -9739,12 +9742,11 @@ func TestExecuteCardAction_ModeCleansUpWithInteractiveKey(t *testing.T) {
 
 // --- 1. Message queue overflow ---
 
-func TestQueueMessageOverflow_DropsOldestAndReturnsfalse(t *testing.T) {
+func TestQueueMessageBurstMergesIntoOne(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	sess := newQueuingSession("qs-overflow")
 	agent := &controllableAgent{nextSession: sess}
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
-
 	key := "test:overflow-user"
 
 	state := &interactiveState{
@@ -9765,34 +9767,41 @@ func TestQueueMessageOverflow_DropsOldestAndReturnsfalse(t *testing.T) {
 		}
 	}
 
+	// 连发合并（custom 2026-10-24）：暂挂期间进来的后续消息并进同一条待处理项，
+	// 只跑一个回合、只回一条回复，不再逐条回执。
 	state.mu.Lock()
-	if len(state.pendingMessages) != defaultMaxQueuedMessages {
-		t.Fatalf("queue depth = %d, want %d", len(state.pendingMessages), defaultMaxQueuedMessages)
+	if len(state.pendingMessages) != 1 {
+		t.Fatalf("queue depth = %d, want 1 (burst merged)", len(state.pendingMessages))
+	}
+	wantMerged := "msg-0\n\nmsg-1\n\nmsg-2\n\nmsg-3\n\nmsg-4"
+	if state.pendingMessages[0].content != wantMerged {
+		t.Fatalf("merged content = %q, want %q", state.pendingMessages[0].content, wantMerged)
 	}
 	state.mu.Unlock()
 
-	// The 6th message should be handled (returns true) but not queued — MsgQueueFull sent.
+	// 再来一条同样并入，不进第二项。
 	overflow := &Message{SessionKey: key, Content: "msg-overflow", ReplyCtx: "ctx-overflow"}
 	ok := e.queueMessageForBusySession(p, overflow, key)
 	if !ok {
-		t.Fatal("expected 6th message to be handled (queue-full reply), got false")
+		t.Fatal("expected extra burst message to be handled, got false")
 	}
 
-	// Queue should still have exactly defaultMaxQueuedMessages items (the original 5).
 	state.mu.Lock()
-	if len(state.pendingMessages) != defaultMaxQueuedMessages {
-		t.Fatalf("queue depth after overflow = %d, want %d", len(state.pendingMessages), defaultMaxQueuedMessages)
+	if len(state.pendingMessages) != 1 {
+		t.Fatalf("queue depth after extra = %d, want 1", len(state.pendingMessages))
 	}
-	// First message should still be msg-0 (FIFO preserved, no silent drop).
-	if state.pendingMessages[0].content != "msg-0" {
-		t.Fatalf("first queued = %q, want msg-0", state.pendingMessages[0].content)
+	if state.pendingMessages[0].content != wantMerged+"\n\nmsg-overflow" {
+		t.Fatalf("content after extra = %q", state.pendingMessages[0].content)
+	}
+	// replyCtx 用最新一条的，保证回信落在最新的 contextToken 上。
+	if state.pendingMessages[0].replyCtx != "ctx-overflow" {
+		t.Fatalf("replyCtx = %v, want ctx-overflow", state.pendingMessages[0].replyCtx)
 	}
 	state.mu.Unlock()
 
-	// Platform should have received MsgMessageQueued for 5 accepted + MsgQueueFull for the overflow.
-	sent := p.getSent()
-	if len(sent) != defaultMaxQueuedMessages+1 {
-		t.Fatalf("platform replies = %d, want %d (queued + queue-full)", len(sent), defaultMaxQueuedMessages+1)
+	// 整段连发不回任何回执。
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("platform replies = %d, want 0 (no queue ack)", len(sent))
 	}
 }
 
@@ -16511,5 +16520,109 @@ func TestBuildSenderPrompt_TimestampPrefix(t *testing.T) {
 	got0 := e.buildSenderPrompt("在？", "u1", "高律师", "weixin", "weixin:dm:u1", "", 0)
 	if strings.HasPrefix(got0, "[Mon") || strings.HasPrefix(got0, "[Tue") {
 		t.Fatalf("零时间戳不应有前缀: %q", got0)
+	}
+}
+
+// 忙时收到的消息只排队合并：不注入当前 turn、不回执，连发只占一个回合。
+func TestQueueMessageBusyMergesIntoOneTurn(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("qs-inline")
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:inline-user"
+	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	for i, text := range []string{"第一条", "第二条"} {
+		ok := e.queueMessageForBusySession(p, &Message{
+			SessionKey: key, Content: text, ReplyCtx: "ctx-2", MessageID: string(rune('a' + i)),
+		}, key)
+		if !ok {
+			t.Fatalf("message %d: expected handled", i)
+		}
+	}
+
+	// 忙时一条都不发给 agent（注入会多出一段回复）。
+	sess.sendMu.Lock()
+	calls := append([]string(nil), sess.sendCalls...)
+	sess.sendMu.Unlock()
+	if len(calls) != 0 {
+		t.Fatalf("sendCalls = %v, want none（忙时只入队）", calls)
+	}
+
+	state.mu.Lock()
+	depth := len(state.pendingMessages)
+	content := ""
+	if depth > 0 {
+		content = state.pendingMessages[0].content
+	}
+	state.mu.Unlock()
+	if depth != 1 {
+		t.Fatalf("queue depth = %d, want 1（连发合并成一条）", depth)
+	}
+	if content != "第一条\n\n第二条" {
+		t.Fatalf("merged content = %q, want 两条拼接", content)
+	}
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("platform replies = %v, want none（不回执）", sent)
+	}
+}
+
+// steer 模式：忙时文字直接送进正在跑的 turn，不入队、不回执。
+func TestQueueMessageSteerModeInjects(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("qs-steer")
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetBusyInputMode("steer")
+
+	key := "test:steer-user"
+	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	ok := e.queueMessageForBusySession(p, &Message{
+		SessionKey: key, Content: "补充一点", ReplyCtx: "ctx-2",
+	}, key)
+	if !ok {
+		t.Fatal("expected message to be handled")
+	}
+
+	sess.sendMu.Lock()
+	calls := append([]string(nil), sess.sendCalls...)
+	sess.sendMu.Unlock()
+	if len(calls) != 1 || calls[0] != "补充一点" {
+		t.Fatalf("sendCalls = %v, want [补充一点]（steer 注入）", calls)
+	}
+
+	state.mu.Lock()
+	depth := len(state.pendingMessages)
+	state.mu.Unlock()
+	if depth != 0 {
+		t.Fatalf("queue depth = %d, want 0（steer 不入队）", depth)
+	}
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("platform replies = %v, want none（不回执）", sent)
+	}
+}
+
+// 未知/空值一律回落 queue。
+func TestSetBusyInputModeNormalizes(t *testing.T) {
+	e := NewEngine("test", &controllableAgent{}, nil, "", LangEnglish)
+	for _, tc := range []struct{ in, want string }{
+		{"steer", BusyInputSteer},
+		{" STEER ", BusyInputSteer},
+		{"queue", BusyInputQueue},
+		{"", BusyInputQueue},
+		{"bogus", BusyInputQueue},
+	} {
+		e.SetBusyInputMode(tc.in)
+		if e.busyInputMode != tc.want {
+			t.Fatalf("SetBusyInputMode(%q) = %q, want %q", tc.in, e.busyInputMode, tc.want)
+		}
 	}
 }

@@ -31,6 +31,16 @@ const maxPlatformMessageLen = 4000
 const telegramBotCommandLimit = 100
 const defaultMaxQueuedMessages = 5 // default cap for queued messages per session
 
+// Busy input modes (queue.busy_input_mode): how a message that arrives while
+// the session is mid-turn is handled.
+const (
+	// BusyInputQueue merges the message into one pending follow-up turn —
+	// the batch runs once after the current turn and produces one reply.
+	BusyInputQueue = "queue"
+	// BusyInputSteer injects the message into the running turn.
+	BusyInputSteer = "steer"
+)
+
 // defaultPendingRestartTimeout is how long the post-restart notify
 // dispatcher waits for the target platform to reach ready before
 // dropping the notify with a warning. 10s covers the typical 2-3s
@@ -446,6 +456,7 @@ type Engine struct {
 	agentSessionIdleTimeoutNanos atomic.Int64
 	agentSessionIdleSeq          atomic.Uint64
 	maxQueuedMessages            int
+	busyInputMode                string // BusyInputQueue (default) or BusyInputSteer
 	dirHistory                   *DirHistory
 	baseWorkDir                  string
 	projectState                 *ProjectStateStore
@@ -818,6 +829,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		eventIdleTimeout:      defaultEventIdleTimeout,
 		staleLockBreakAfter:   busyStaleLockMaxHeld,
 		maxQueuedMessages:     defaultMaxQueuedMessages,
+		busyInputMode:         BusyInputQueue,
 		showContextIndicator:  true,
 		showWorkdirIndicator:  true,
 		shell:                 defaultShell(),
@@ -1452,6 +1464,17 @@ func (e *Engine) SetMaxQueuedMessages(n int) {
 	if n > 0 {
 		e.maxQueuedMessages = n
 	}
+}
+
+// SetBusyInputMode selects how a message arriving mid-turn is handled.
+// BusyInputSteer injects it into the running turn; anything else (including
+// the empty string) falls back to BusyInputQueue.
+func (e *Engine) SetBusyInputMode(mode string) {
+	if strings.EqualFold(strings.TrimSpace(mode), BusyInputSteer) {
+		e.busyInputMode = BusyInputSteer
+		return
+	}
+	e.busyInputMode = BusyInputQueue
 }
 
 func (e *Engine) SetRelayManager(rm *RelayManager) {
@@ -3438,10 +3461,51 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		e.logStaleUserMessageDropped("reject_before_queue", msg, interactiveKey, snap)
 		return true
 	}
+	// steer 模式：文字直接送进正在跑的 turn（对应 Hermes 的 busy_input_mode=steer）。
+	// ACP 没有 Hermes 的 agent.steer() 通道，这里是追加一条 prompt；agent 拒收
+	// 并发 prompt 时回落到下面的排队合并。
+	if e.busyInputMode == BusyInputSteer && len(msg.Images) == 0 && len(msg.Files) == 0 &&
+		state.agentSession != nil && state.agentSession.Alive() {
+		if err := state.agentSession.Send(msg.Content, msg.MessageID, nil, nil); err == nil {
+			runMessageAccepted(msg)
+			slog.Info("steer: message injected into running turn",
+				"session", msg.SessionKey,
+				"user", msg.UserName,
+			)
+			return true
+		} else {
+			slog.Warn("steer: inject failed; falling back to queue merge",
+				"session", msg.SessionKey, "error", err)
+		}
+	}
+	// 忙时消息一律排队、不注入当前 turn：注入会让 agent 把追加内容当成新一轮
+	// 输入、多出一段回复。这里只入队，并在下面并进队尾那一条，等本轮结束后
+	// 作为一次 follow-up 跑完，只回一条回复。
 	if len(state.pendingMessages) >= e.maxQueuedMessages {
 		depth := len(state.pendingMessages)
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgQueueFull), depth))
 		return true // handled: queue-full reply sent
+	}
+	// 连发合并（custom 2026-10-24）：队列里最后一条还没开始处理，就把本条并进它的正文。
+	// 这样连发几条只跑一个回合、只回一条回复，既不占回执额度，也不会多条回复互挤限流。
+	// replyCtx 换成最新一条的——iLink 的 contextToken 用来回信，越新越稳。
+	if n := len(state.pendingMessages); n > 0 {
+		last := &state.pendingMessages[n-1]
+		last.content = last.content + "\n\n" + msg.Content
+		last.images = append(last.images, msg.Images...)
+		last.files = append(last.files, msg.Files...)
+		last.fromVoice = last.fromVoice || msg.FromVoice
+		last.replyCtx = msg.ReplyCtx
+		if msg.UserMessageTimeMs > last.userMessageTimeMs {
+			last.userMessageTimeMs = msg.UserMessageTimeMs
+		}
+		runMessageAccepted(msg)
+		slog.Info("queued message merged into previous",
+			"session", msg.SessionKey,
+			"user", msg.UserName,
+			"queue_depth", len(state.pendingMessages),
+		)
+		return true
 	}
 	state.pendingMessages = append(state.pendingMessages, queuedMessage{
 		messageID:         msg.MessageID,
@@ -3474,7 +3538,8 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		"user", msg.UserName,
 		"queue_depth", queueDepth,
 	)
-	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
+	// 排队回执一律不发：每条回执都占 iLink 的回复窗口额度，会把正文挤到限流。
+	// 队列照常入队、照常按序处理，只是不再回这一条确认。
 	return true
 }
 
