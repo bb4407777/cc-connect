@@ -16603,7 +16603,7 @@ func TestTrySteerBusyMessageInjects(t *testing.T) {
 	e.SetBusyInputMode("steer")
 
 	key := "test:steer-user"
-	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx", turnToolInFlight: 1}
 	e.interactiveMu.Lock()
 	e.interactiveStates[key] = state
 	e.interactiveMu.Unlock()
@@ -16642,6 +16642,30 @@ func TestTrySteerBusyMessageInjects(t *testing.T) {
 	}
 }
 
+// 文本流阶段（没有工具在途）不注入：回归 2026-11-06 微信会话里插队消息被
+// 后端折进已起跑的模型步、整轮无人作答的问题。
+func TestTrySteerBusyMessageRefusedWithoutToolInFlight(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newSteerSession("qs-steer-text")
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetBusyInputMode("steer")
+
+	key := "test:steer-text"
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	e.interactiveMu.Unlock()
+
+	if e.trySteerBusyMessage(p, &Message{SessionKey: key, Content: "文本流里插一句", ReplyCtx: "ctx-2"}, key) {
+		t.Fatal("没有工具在途时必须放弃注入，交回排队通道")
+	}
+	select {
+	case got := <-sess.steerCh:
+		t.Fatalf("Steer called with %q, want no injection", got)
+	default:
+	}
+}
+
 // Steer 卡住时 trySteerBusyMessage 必须立刻返回，不能把入站处理器拖住。
 func TestTrySteerBusyMessageDoesNotBlock(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
@@ -16653,11 +16677,13 @@ func TestTrySteerBusyMessageDoesNotBlock(t *testing.T) {
 
 	key := "test:steer-block"
 	e.interactiveMu.Lock()
-	e.interactiveStates[key] = &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	e.interactiveStates[key] = &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx", turnToolInFlight: 1}
 	e.interactiveMu.Unlock()
 
 	done := make(chan bool, 1)
-	go func() { done <- e.trySteerBusyMessage(p, &Message{SessionKey: key, Content: "卡住也要返回"}, key) }()
+	go func() {
+		done <- e.trySteerBusyMessage(p, &Message{SessionKey: key, Content: "卡住也要返回"}, key)
+	}()
 	select {
 	case ok := <-done:
 		if !ok {
@@ -16679,7 +16705,7 @@ func TestTrySteerBusyMessageFallsBackToQueueOnError(t *testing.T) {
 	e.SetBusyInputMode("steer")
 
 	key := "test:steer-fail"
-	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx", turnToolInFlight: 1}
 	e.interactiveMu.Lock()
 	e.interactiveStates[key] = state
 	e.interactiveMu.Unlock()
@@ -16713,7 +16739,7 @@ func TestTrySteerBusyMessageSkipsAttachments(t *testing.T) {
 
 	key := "test:steer-attach"
 	e.interactiveMu.Lock()
-	e.interactiveStates[key] = &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	e.interactiveStates[key] = &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx", turnToolInFlight: 1}
 	e.interactiveMu.Unlock()
 
 	ok := e.trySteerBusyMessage(p, &Message{

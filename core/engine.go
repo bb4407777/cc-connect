@@ -632,6 +632,11 @@ type interactiveState struct {
 	// cleared to false only after a clean EventResult.
 	eventsNeedResync bool
 
+	// turnToolInFlight counts tool calls emitted without a result yet in the
+	// running turn. trySteerBusyMessage uses it as the only safe injection
+	// window: see the comment there.
+	turnToolInFlight int
+
 	// lastCompletedUserMessageTimeMs is the max platform user-message create time
 	// (ms) for which an agent turn has finished with EventResult.
 	lastCompletedUserMessageTimeMs int64
@@ -3339,6 +3344,20 @@ sessionLocked:
 	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey, lockGen)
 }
 
+// noteTurnToolEvent tracks how many tool calls of the running turn are still
+// awaiting a result. Steering is only safe while that count is non-zero.
+func (e *Engine) noteTurnToolEvent(state *interactiveState, delta int) {
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	state.turnToolInFlight += delta
+	if state.turnToolInFlight < 0 {
+		state.turnToolInFlight = 0
+	}
+	state.mu.Unlock()
+}
+
 func runMessageAccepted(msg *Message) {
 	if msg == nil || msg.OnAccepted == nil {
 		return
@@ -3432,8 +3451,8 @@ func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions 
 
 // trySteerBusyMessage hands a mid-turn text message to the running turn when
 // queue.busy_input_mode = "steer". It returns true when the message was handed
-// off; any fallback (attachments, dead/unsupporting agent, inject error) leaves
-// it to the caller's queue path.
+// off; any fallback (attachments, dead/unsupporting agent, inject error, no
+// tool call in flight) leaves it to the caller's queue path.
 //
 // The inject RPC is issued asynchronously and without state.mu: the agent may
 // take until the end of the turn to answer, and the event loop needs that lock
@@ -3456,8 +3475,17 @@ func (e *Engine) trySteerBusyMessage(p Platform, msg *Message, interactiveKey st
 	state.mu.Lock()
 	as := state.agentSession
 	stale := e.isStaleUserMessageLocked(state, msg.UserMessageTimeMs)
+	toolInFlight := state.turnToolInFlight
 	state.mu.Unlock()
 	if stale || as == nil || !as.Alive() {
+		return false
+	}
+	// 只在工具调用在途（tool_use 已发、结果未回）时注入：这时本轮必然还有
+	// 一次模型步去读折进来的文本。文本流阶段注入则相反——当前模型步早已
+	// 起跑，输出里不会带上这句，回合随之结束，消息被静默吞掉（2026-11-06
+	// 微信会话实测：22:45:22 注入，22:49:09 回合结束，全程无第二次作答）。
+	// 其余相位一律落到排队通道，本轮结束后单独作答，宁可晚不可丢。
+	if toolInFlight == 0 {
 		return false
 	}
 	steerer, ok := as.(Steerer)
@@ -4112,6 +4140,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	state.replyCtx = msg.ReplyCtx
 	state.currentMessageID = msg.MessageID
 	state.currentTurnUserMessageTimeMs = msg.UserMessageTimeMs
+	state.turnToolInFlight = 0
 	state.mu.Unlock()
 	stopRecallMonitor := e.startMessageRecallMonitor(interactiveKey)
 	defer stopRecallMonitor()
@@ -5664,6 +5693,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		case EventToolUse:
 			toolCount++
+			e.noteTurnToolEvent(state, 1)
 			if hasRichCard {
 				// When tool messages are suppressed, skip card updates on tool events.
 				if !e.display.ToolMessages {
@@ -5793,6 +5823,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 		case EventToolResult:
+			e.noteTurnToolEvent(state, -1)
 			if e.display.ToolMessages {
 				result := strings.TrimSpace(event.ToolResult)
 				if result == "" {
@@ -6086,6 +6117,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				continue
 			}
 			cp.Finalize(ProgressCardStateCompleted)
+			// 回合收尾：清掉工具在途计数，别让上一轮的残留影响下一次注入判定。
+			state.mu.Lock()
+			state.turnToolInFlight = 0
+			state.mu.Unlock()
 			// Use state.agentSession.CurrentSessionID() instead of event.SessionID.
 			// event.SessionID may be empty in some cases, causing the agent_session_id
 			// to not be persisted to disk, breaking session resume on next startup.
@@ -6532,6 +6567,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.currentMessageID = queued.messageID
 				state.fromVoice = queued.fromVoice
 				state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
+				state.turnToolInFlight = 0
 				state.mu.Unlock()
 
 				// Stop the previous turn's typing indicator
@@ -6883,6 +6919,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.currentMessageID = queued.messageID
 		state.fromVoice = queued.fromVoice
 		state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
+		state.turnToolInFlight = 0
 		state.mu.Unlock()
 
 		e.i18n.DetectAndSet(queued.content)
