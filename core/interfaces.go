@@ -376,6 +376,14 @@ type AgentSession interface {
 	Close() error
 }
 
+// Steerer is implemented by agent sessions that can inject a message into the
+// turn that is already running instead of starting a new one. The agent folds
+// the text into the in-flight turn, so the injected text arrives as part of
+// that turn's reply; implementations must not emit an EventResult for it.
+type Steerer interface {
+	Steer(prompt string, messageID string, images []ImageAttachment, files []FileAttachment) error
+}
+
 // PermissionResult represents the user's decision on a permission request.
 type PermissionResult struct {
 	Behavior     string         `json:"behavior"`               // "allow" or "deny"

@@ -683,23 +683,9 @@ func (s *acpSession) Send(prompt string, messageID string, images []core.ImageAt
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 
-	filePaths := core.SaveFilesToDisk(s.workDir, messageID, files)
-	prompt = core.AppendFileRefs(prompt, filePaths)
-	if len(images) > 0 {
-		prompt = s.appendImageRefs(prompt, images)
-	}
-
-	sid := s.currentACPSessionID()
-	if sid == "" {
-		return fmt.Errorf("acp: no agent session id")
-	}
-
-	promptBlocks := []any{
-		map[string]any{"type": "text", "text": prompt},
-	}
-	params := map[string]any{
-		"sessionId": sid,
-		"prompt":    promptBlocks,
+	sid, params, err := s.composePrompt(prompt, messageID, images, files)
+	if err != nil {
+		return err
 	}
 
 	slog.Debug("acp: sending session/prompt", "session_id", sid, "prompt_len", len(prompt))
@@ -717,6 +703,54 @@ func (s *acpSession) Send(prompt string, messageID string, images []core.ImageAt
 		Done:      true,
 	})
 	return nil
+}
+
+// Steer injects a message into the turn that is already running. CodeBuddy's
+// ACP backend acknowledges such a prompt immediately (an empty end_turn) and
+// folds the text into the in-flight turn, so its output streams as part of that
+// turn's reply.
+//
+// Two rules make that safe:
+//   - no sendMu: Send holds it for the whole turn (session/prompt only returns
+//     at turn end), so taking it here would delay the injection until the turn
+//     was already over;
+//   - no EventResult/EventError: the running turn owns the result. Emitting one
+//     for the acknowledgement would close the turn with partial text.
+func (s *acpSession) Steer(prompt string, messageID string, images []core.ImageAttachment, files []core.FileAttachment) error {
+	if !s.alive.Load() {
+		return fmt.Errorf("acp: session closed")
+	}
+	sid, params, err := s.composePrompt(prompt, messageID, images, files)
+	if err != nil {
+		return err
+	}
+	slog.Debug("acp: steering session/prompt", "session_id", sid, "prompt_len", len(prompt))
+	if _, err := s.tr.call(s.ctx, "session/prompt", params); err != nil {
+		return fmt.Errorf("acp: steer session/prompt: %w", err)
+	}
+	return nil
+}
+
+// composePrompt builds the session/prompt params for Send and Steer.
+func (s *acpSession) composePrompt(prompt string, messageID string, images []core.ImageAttachment, files []core.FileAttachment) (string, map[string]any, error) {
+	filePaths := core.SaveFilesToDisk(s.workDir, messageID, files)
+	prompt = core.AppendFileRefs(prompt, filePaths)
+	if len(images) > 0 {
+		prompt = s.appendImageRefs(prompt, images)
+	}
+
+	sid := s.currentACPSessionID()
+	if sid == "" {
+		return "", nil, fmt.Errorf("acp: no agent session id")
+	}
+
+	promptBlocks := []any{
+		map[string]any{"type": "text", "text": prompt},
+	}
+	return sid, map[string]any{
+		"sessionId": sid,
+		"prompt":    promptBlocks,
+	}, nil
 }
 
 func (s *acpSession) appendImageRefs(prompt string, images []core.ImageAttachment) string {

@@ -3285,8 +3285,11 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 			}
 		}
 		// ── end self-heal; queueing path below is unchanged ────────────────
-		// Session is busy — try to queue the message for the running turn
-		// so the agent processes it immediately after the current turn ends.
+		// Session is busy — in steer mode hand the text to the running turn
+		// first; otherwise queue it for the agent to run once the turn ends.
+		if e.trySteerBusyMessage(p, msg, interactiveKey) {
+			return
+		}
 		if e.queueMessageForBusySession(p, msg, interactiveKey) {
 			// Race guard: the drain loop in processInteractiveMessageWith may
 			// have just finished (session unlocked) between our TryLock failure
@@ -3427,6 +3430,62 @@ func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions 
 	return newSession, newGen
 }
 
+// trySteerBusyMessage hands a mid-turn text message to the running turn when
+// queue.busy_input_mode = "steer". It returns true when the message was handed
+// off; any fallback (attachments, dead/unsupporting agent, inject error) leaves
+// it to the caller's queue path.
+//
+// The inject RPC is issued asynchronously and without state.mu: the agent may
+// take until the end of the turn to answer, and the event loop needs that lock
+// to finish the turn.
+func (e *Engine) trySteerBusyMessage(p Platform, msg *Message, interactiveKey string) bool {
+	if e.busyInputMode != BusyInputSteer || msg == nil {
+		return false
+	}
+	if len(msg.Images) > 0 || len(msg.Files) > 0 {
+		return false
+	}
+
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[interactiveKey]
+	e.interactiveMu.Unlock()
+	if state == nil {
+		return false
+	}
+
+	state.mu.Lock()
+	as := state.agentSession
+	stale := e.isStaleUserMessageLocked(state, msg.UserMessageTimeMs)
+	state.mu.Unlock()
+	if stale || as == nil || !as.Alive() {
+		return false
+	}
+	steerer, ok := as.(Steerer)
+	if !ok {
+		return false
+	}
+
+	content, messageID, images, files := msg.Content, msg.MessageID, msg.Images, msg.Files
+	runMessageAccepted(msg)
+	go func() {
+		if err := steerer.Steer(content, messageID, images, files); err != nil {
+			slog.Warn("steer: inject failed; falling back to queue merge",
+				"session", msg.SessionKey,
+				"error", err,
+			)
+			if !e.queueMessageForBusySession(p, msg, interactiveKey) {
+				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
+			}
+			return
+		}
+		slog.Info("steer: message injected into running turn",
+			"session", msg.SessionKey,
+			"user", msg.UserName,
+		)
+	}()
+	return true
+}
+
 // queueMessageForBusySession queues a message for later delivery when the
 // session is busy. The message is NOT sent to agent stdin at queue time;
 // the event loop sends it after the current turn's EventResult is received.
@@ -3461,26 +3520,8 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		e.logStaleUserMessageDropped("reject_before_queue", msg, interactiveKey, snap)
 		return true
 	}
-	// steer 模式：文字直接送进正在跑的 turn（对应 Hermes 的 busy_input_mode=steer）。
-	// ACP 没有 Hermes 的 agent.steer() 通道，这里是追加一条 prompt；agent 拒收
-	// 并发 prompt 时回落到下面的排队合并。
-	if e.busyInputMode == BusyInputSteer && len(msg.Images) == 0 && len(msg.Files) == 0 &&
-		state.agentSession != nil && state.agentSession.Alive() {
-		if err := state.agentSession.Send(msg.Content, msg.MessageID, nil, nil); err == nil {
-			runMessageAccepted(msg)
-			slog.Info("steer: message injected into running turn",
-				"session", msg.SessionKey,
-				"user", msg.UserName,
-			)
-			return true
-		} else {
-			slog.Warn("steer: inject failed; falling back to queue merge",
-				"session", msg.SessionKey, "error", err)
-		}
-	}
-	// 忙时消息一律排队、不注入当前 turn：注入会让 agent 把追加内容当成新一轮
-	// 输入、多出一段回复。这里只入队，并在下面并进队尾那一条，等本轮结束后
-	// 作为一次 follow-up 跑完，只回一条回复。
+	// steer 模式在进入本函数前已尝试注入（见 trySteerBusyMessage）：注入不成或
+	// 非文字消息才落到这里，一律排队合并，不往 agent stdin 追加。
 	if len(state.pendingMessages) >= e.maxQueuedMessages {
 		depth := len(state.pendingMessages)
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgQueueFull), depth))

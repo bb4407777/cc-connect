@@ -8678,6 +8678,29 @@ func (s *queuingAgentSession) Send(prompt string, _ string, _ []ImageAttachment,
 	return nil
 }
 
+// steerAgentSession records Steer calls; Steer can be made to fail or block.
+type steerAgentSession struct {
+	queuingAgentSession
+	steerCh    chan string
+	steerErr   error
+	blockSteer chan struct{} // when non-nil, Steer waits for close before returning
+}
+
+func newSteerSession(id string) *steerAgentSession {
+	return &steerAgentSession{
+		queuingAgentSession: *newQueuingSession(id),
+		steerCh:             make(chan string, 8),
+	}
+}
+
+func (s *steerAgentSession) Steer(prompt string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.steerCh <- prompt
+	if s.blockSteer != nil {
+		<-s.blockSteer
+	}
+	return s.steerErr
+}
+
 // blockingSendAgentSession blocks in Send until unblock is closed, mimicking agents
 // whose Send does not return until the prompt turn completes (e.g. ACP session/prompt).
 type blockingSendAgentSession struct {
@@ -16571,10 +16594,10 @@ func TestQueueMessageBusyMergesIntoOneTurn(t *testing.T) {
 	}
 }
 
-// steer 模式：忙时文字直接送进正在跑的 turn，不入队、不回执。
-func TestQueueMessageSteerModeInjects(t *testing.T) {
+// steer 模式：忙时文字异步注入正在跑的 turn，不入队、不回执、不占 Send。
+func TestTrySteerBusyMessageInjects(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
-	sess := newQueuingSession("qs-steer")
+	sess := newSteerSession("qs-steer")
 	agent := &controllableAgent{nextSession: sess}
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
 	e.SetBusyInputMode("steer")
@@ -16585,18 +16608,27 @@ func TestQueueMessageSteerModeInjects(t *testing.T) {
 	e.interactiveStates[key] = state
 	e.interactiveMu.Unlock()
 
-	ok := e.queueMessageForBusySession(p, &Message{
+	ok := e.trySteerBusyMessage(p, &Message{
 		SessionKey: key, Content: "补充一点", ReplyCtx: "ctx-2",
 	}, key)
 	if !ok {
-		t.Fatal("expected message to be handled")
+		t.Fatal("expected message to be steered")
+	}
+
+	select {
+	case got := <-sess.steerCh:
+		if got != "补充一点" {
+			t.Fatalf("steered content = %q, want 补充一点", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Steer was not called")
 	}
 
 	sess.sendMu.Lock()
 	calls := append([]string(nil), sess.sendCalls...)
 	sess.sendMu.Unlock()
-	if len(calls) != 1 || calls[0] != "补充一点" {
-		t.Fatalf("sendCalls = %v, want [补充一点]（steer 注入）", calls)
+	if len(calls) != 0 {
+		t.Fatalf("sendCalls = %v, want none（注入不走 Send，避免占住整轮）", calls)
 	}
 
 	state.mu.Lock()
@@ -16607,6 +16639,88 @@ func TestQueueMessageSteerModeInjects(t *testing.T) {
 	}
 	if sent := p.getSent(); len(sent) != 0 {
 		t.Fatalf("platform replies = %v, want none（不回执）", sent)
+	}
+}
+
+// Steer 卡住时 trySteerBusyMessage 必须立刻返回，不能把入站处理器拖住。
+func TestTrySteerBusyMessageDoesNotBlock(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newSteerSession("qs-steer-block")
+	sess.blockSteer = make(chan struct{})
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetBusyInputMode("steer")
+
+	key := "test:steer-block"
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	e.interactiveMu.Unlock()
+
+	done := make(chan bool, 1)
+	go func() { done <- e.trySteerBusyMessage(p, &Message{SessionKey: key, Content: "卡住也要返回"}, key) }()
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("expected steered")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("trySteerBusyMessage blocked on a hanging Steer")
+	}
+	close(sess.blockSteer)
+}
+
+// 注入失败回落到排队，消息不丢。
+func TestTrySteerBusyMessageFallsBackToQueueOnError(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newSteerSession("qs-steer-fail")
+	sess.steerErr = fmt.Errorf("agent refused concurrent prompt")
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetBusyInputMode("steer")
+
+	key := "test:steer-fail"
+	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	if !e.trySteerBusyMessage(p, &Message{SessionKey: key, Content: "退回排队"}, key) {
+		t.Fatal("expected steered")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		state.mu.Lock()
+		depth := len(state.pendingMessages)
+		state.mu.Unlock()
+		if depth == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("queue depth = %d, want 1（注入失败要回落排队）", depth)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// 带附件的消息不走 steer（ACP 注入只送文字），交回排队路径。
+func TestTrySteerBusyMessageSkipsAttachments(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newSteerSession("qs-steer-attach")
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetBusyInputMode("steer")
+
+	key := "test:steer-attach"
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	e.interactiveMu.Unlock()
+
+	ok := e.trySteerBusyMessage(p, &Message{
+		SessionKey: key, Content: "看图", Images: []ImageAttachment{{Data: []byte("x")}},
+	}, key)
+	if ok {
+		t.Fatal("attachments must not be steered")
 	}
 }
 
